@@ -1,0 +1,67 @@
+[package]
+name = "memo-stt"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+authors = ["Memo Team"]
+description = "Plug-and-play speech-to-text library: 3 lines of code to add STT to any Rust application. GPU-accelerated Whisper, zero configuration, works everywhere."
+license = "MIT"
+repository = "https://github.com/memo/memo-stt"
+homepage = "https://github.com/memo/memo-stt"
+documentation = "https://docs.rs/memo-stt"
+keywords = [
+    "speech-to-text", "stt", "whisper", "transcription",
+    "voice", "audio", "dictation", "asr", "speech-recognition",
+    "gpu", "metal", "cross-platform", "plug-and-play", "easy",
+    "simple", "lightweight", "fast", "real-time"
+]
+categories = [
+    "multimedia::audio",
+    "multimedia::speech",
+    "science::ai::machine-learning",
+    "development-tools",
+    "api-bindings"
+]
+readme = "README.md"
+
+[lib]
+name = "memo_stt"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "memo-stt"
+path = "src/main.rs"
+
+[features]
+default = ["binary"]
+binary = ["cpal", "rdev", "enigo"]
+
+[dependencies]
+# Whisper STT with Metal GPU acceleration
+whisper-rs = { version = "0.12", features = ["metal"] }
+
+# Model downloading
+ureq = { version = "2.9", default-features = false, features = ["tls"] }
+dirs = "5.0"
+
+# JSON output for FINAL: transcriptions
+serde_json = "1.0"
+
+# Binary-only dependencies (for the memo-stt binary)
+# These are optional for library users
+cpal = { version = "0.15", optional = true }
+rdev = { version = "0.5", optional = true }
+enigo = { version = "0.1", optional = true }
+
+
+
+
+[profile.release]
+opt-level = 3            # Optimize for speed
+lto = "fat"              # Full link-time optimization for maximum speed
+codegen-units = 1        # Better optimization
+strip = true             # Strip symbols
+
+[profile.dev]
+opt-level = 0
+debug = true
