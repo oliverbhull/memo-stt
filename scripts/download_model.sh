@@ -64,3 +64,7 @@ echo ""
 echo "Total size:"
 du -sh "$MODELS_DIR" 2>/dev/null || true
 
+
+
+
+

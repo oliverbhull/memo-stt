@@ -45,3 +45,7 @@ echo "You can now run: cargo run --example trigger_mic"
 echo ""
 echo "To deactivate the virtual environment, run: deactivate"
 
+
+
+
+

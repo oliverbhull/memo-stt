@@ -66,3 +66,7 @@ pub fn get_application_context() -> (String, String) {
     (app_name, window_title)
 }
 
+
+
+
+

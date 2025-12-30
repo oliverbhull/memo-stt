@@ -12,6 +12,33 @@ use std::time::Instant;
 use std::collections::VecDeque;
 use serde_json::json;
 mod app_detection;
+
+// Calculate audio levels for waveform visualization
+// Returns 7 normalized levels (0.0-1.0) for the 7 bars
+fn calculate_audio_levels(samples: &[i16]) -> Vec<f32> {
+    if samples.is_empty() {
+        return vec![0.0; 7];
+    }
+    
+    // Calculate RMS (Root Mean Square) for audio level
+    let sum_squares: i64 = samples.iter().map(|&s| (s as i64).pow(2)).sum();
+    let rms = (sum_squares as f32 / samples.len() as f32).sqrt();
+    
+    // Normalize to 0-1 range (i16 max is 32767)
+    // Use lower threshold and gain boost for better reactivity (similar to memo-desktop system mic)
+    const NORMALIZATION_THRESHOLD: f32 = 15000.0;
+    const GAIN_BOOST: f32 = 2.0;
+    let normalized = ((rms / NORMALIZATION_THRESHOLD) * GAIN_BOOST).min(1.0);
+    
+    // Apply exponential scaling for better visual response
+    let scaled = normalized.powf(0.4);
+    
+    // Create 7 bands with symmetric weighting (center bars higher, edges taper down)
+    let weights = vec![0.6, 0.8, 0.95, 1.0, 0.95, 0.8, 0.6];
+    weights.into_iter()
+        .map(|w| (scaled * w).min(1.0))
+        .collect()
+}
 #[cfg(not(target_os = "macos"))]
 use enigo::{Enigo, KeyboardControllable, Key as EnigoKey};
 
@@ -234,6 +261,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     audio_buffer_clone.lock().unwrap().clear();
                     
                     let buffer = audio_buffer_clone.clone();
+                    let is_recording_for_audio = is_recording_clone.clone();
+                    let last_audio_level_sent = Arc::new(Mutex::new(Instant::now()));
+                    let last_audio_level_sent_clone = last_audio_level_sent.clone();
                     let stream_config = config_clone.clone().into();
                     let stream_result = match config_clone.sample_format() {
                         cpal::SampleFormat::I16 => {
@@ -241,6 +271,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &stream_config,
                                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
                                     buffer.lock().unwrap().extend_from_slice(data);
+                                    
+                                    // Calculate and send audio levels for waveform visualization
+                                    if is_recording_for_audio.load(Ordering::Acquire) {
+                                        let levels = calculate_audio_levels(data);
+                                        let mut last_sent = last_audio_level_sent_clone.lock().unwrap();
+                                        // Throttle to ~20fps (50ms intervals)
+                                        if last_sent.elapsed().as_millis() >= 50 {
+                                            let json = json!(levels).to_string();
+                                            println!("AUDIO_LEVELS:{}", json);
+                                            *last_sent = Instant::now();
+                                        }
+                                    }
                                 },
                                 |err| eprintln!("Audio error: {}", err),
                                 None,
@@ -251,8 +293,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &stream_config,
                                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                                     let mut buf = buffer.lock().unwrap();
+                                    let mut i16_samples = Vec::with_capacity(data.len());
                                     for &s in data {
-                                        buf.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
+                                        let i16_sample = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                                        buf.push(i16_sample);
+                                        i16_samples.push(i16_sample);
+                                    }
+                                    
+                                    // Calculate and send audio levels for waveform visualization
+                                    if is_recording_for_audio.load(Ordering::Acquire) {
+                                        let levels = calculate_audio_levels(&i16_samples);
+                                        let mut last_sent = last_audio_level_sent_clone.lock().unwrap();
+                                        // Throttle to ~20fps (50ms intervals)
+                                        if last_sent.elapsed().as_millis() >= 50 {
+                                            let json = json!(levels).to_string();
+                                            println!("AUDIO_LEVELS:{}", json);
+                                            *last_sent = Instant::now();
+                                        }
                                     }
                                 },
                                 |err| eprintln!("Audio error: {}", err),
@@ -264,8 +321,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &stream_config,
                                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
                                     let mut buf = buffer.lock().unwrap();
+                                    let mut i16_samples = Vec::with_capacity(data.len());
                                     for &s in data {
-                                        buf.push(((s as i32) - 32768) as i16);
+                                        let i16_sample = ((s as i32) - 32768) as i16;
+                                        buf.push(i16_sample);
+                                        i16_samples.push(i16_sample);
+                                    }
+                                    
+                                    // Calculate and send audio levels for waveform visualization
+                                    if is_recording_for_audio.load(Ordering::Acquire) {
+                                        let levels = calculate_audio_levels(&i16_samples);
+                                        let mut last_sent = last_audio_level_sent_clone.lock().unwrap();
+                                        // Throttle to ~20fps (50ms intervals)
+                                        if last_sent.elapsed().as_millis() >= 50 {
+                                            let json = json!(levels).to_string();
+                                            println!("AUDIO_LEVELS:{}", json);
+                                            *last_sent = Instant::now();
+                                        }
                                     }
                                 },
                                 |err| eprintln!("Audio error: {}", err),
@@ -442,6 +514,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             audio_buffer_clone.lock().unwrap().clear();
                             
                             let buffer = audio_buffer_clone.clone();
+                            let is_recording_for_audio_lock = is_recording_clone.clone();
+                            let last_audio_level_sent_lock = Arc::new(Mutex::new(Instant::now()));
+                            let last_audio_level_sent_lock_clone = last_audio_level_sent_lock.clone();
                             let stream_config = config_clone.clone().into();
                             let stream_result = match config_clone.sample_format() {
                                 cpal::SampleFormat::I16 => {
@@ -449,6 +524,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         &stream_config,
                                         move |data: &[i16], _: &cpal::InputCallbackInfo| {
                                             buffer.lock().unwrap().extend_from_slice(data);
+                                            
+                                            // Calculate and send audio levels for waveform visualization
+                                            if is_recording_for_audio_lock.load(Ordering::Acquire) {
+                                                let levels = calculate_audio_levels(data);
+                                                let mut last_sent = last_audio_level_sent_lock_clone.lock().unwrap();
+                                                if last_sent.elapsed().as_millis() >= 50 {
+                                                    let json = json!(levels).to_string();
+                                                    println!("AUDIO_LEVELS:{}", json);
+                                                    *last_sent = Instant::now();
+                                                }
+                                            }
                                         },
                                         |err| eprintln!("Audio error: {}", err),
                                         None,
@@ -459,8 +545,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         &stream_config,
                                         move |data: &[f32], _: &cpal::InputCallbackInfo| {
                                             let mut buf = buffer.lock().unwrap();
+                                            let mut i16_samples = Vec::with_capacity(data.len());
                                             for &s in data {
-                                                buf.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
+                                                let i16_sample = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                                                buf.push(i16_sample);
+                                                i16_samples.push(i16_sample);
+                                            }
+                                            
+                                            // Calculate and send audio levels for waveform visualization
+                                            if is_recording_for_audio_lock.load(Ordering::Acquire) {
+                                                let levels = calculate_audio_levels(&i16_samples);
+                                                let mut last_sent = last_audio_level_sent_lock_clone.lock().unwrap();
+                                                if last_sent.elapsed().as_millis() >= 50 {
+                                                    let json = json!(levels).to_string();
+                                                    println!("AUDIO_LEVELS:{}", json);
+                                                    *last_sent = Instant::now();
+                                                }
                                             }
                                         },
                                         |err| eprintln!("Audio error: {}", err),
@@ -472,8 +572,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         &stream_config,
                                         move |data: &[u16], _: &cpal::InputCallbackInfo| {
                                             let mut buf = buffer.lock().unwrap();
+                                            let mut i16_samples = Vec::with_capacity(data.len());
                                             for &s in data {
-                                                buf.push(((s as i32) - 32768) as i16);
+                                                let i16_sample = ((s as i32) - 32768) as i16;
+                                                buf.push(i16_sample);
+                                                i16_samples.push(i16_sample);
+                                            }
+                                            
+                                            // Calculate and send audio levels for waveform visualization
+                                            if is_recording_for_audio_lock.load(Ordering::Acquire) {
+                                                let levels = calculate_audio_levels(&i16_samples);
+                                                let mut last_sent = last_audio_level_sent_lock_clone.lock().unwrap();
+                                                if last_sent.elapsed().as_millis() >= 50 {
+                                                    let json = json!(levels).to_string();
+                                                    println!("AUDIO_LEVELS:{}", json);
+                                                    *last_sent = Instant::now();
+                                                }
                                             }
                                         },
                                         |err| eprintln!("Audio error: {}", err),
