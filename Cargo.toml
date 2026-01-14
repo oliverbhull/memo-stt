@@ -34,7 +34,7 @@ path = "src/main.rs"
 
 [features]
 default = ["binary"]
-binary = ["cpal", "rdev", "enigo"]
+binary = ["cpal", "rdev", "enigo", "audiopus", "anyhow", "log", "btleplug", "tokio", "futures", "uuid", "base64"]
 
 [dependencies]
 # Whisper STT with Metal GPU acceleration
@@ -52,6 +52,18 @@ serde_json = "1.0"
 cpal = { version = "0.15", optional = true }
 rdev = { version = "0.5", optional = true }
 enigo = { version = "0.1", optional = true }
+
+# Opus decoder for BLE audio
+audiopus = { version = "0.2", optional = true }
+anyhow = { version = "1.0", optional = true }
+log = { version = "0.4", optional = true }
+base64 = { version = "0.22", optional = true }
+
+# BLE connectivity
+btleplug = { version = "0.11", optional = true }
+tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "macros"], optional = true }
+futures = { version = "0.3", optional = true }
+uuid = { version = "1.0", features = ["v4"], optional = true }
 
 
 
