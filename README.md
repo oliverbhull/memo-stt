@@ -6,7 +6,7 @@
 [![docs.rs](https://docs.rs/memo-stt/badge.svg)](https://docs.rs/memo-stt)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## 🚀 Quick Start (3 Lines)
+## Quick Start (3 Lines)
 
 ```rust
 use memo_stt::SttEngine;
@@ -17,7 +17,7 @@ let text = engine.transcribe(&audio_samples)?;
 // Done! You have transcribed text.
 ```
 
-## ✨ Why memo-stt?
+## Why memo-stt?
 
 - **Zero Configuration** - Works out of the box, no API keys, no setup
 - **Automatic Model Download** - Models download automatically on first use
@@ -28,7 +28,7 @@ let text = engine.transcribe(&audio_samples)?;
 - **Fast** - 200-500ms transcription latency
 - **Private** - Everything runs locally, no cloud calls
 
-## 📦 Installation
+## Installation
 
 ```toml
 [dependencies]
@@ -39,7 +39,7 @@ memo-stt = "0.1"
 cargo add memo-stt
 ```
 
-## 🎯 Use Cases
+## Use Cases
 
 Perfect for:
 - **Voice commands** in desktop applications
@@ -51,7 +51,7 @@ Perfect for:
 - **BLE-connected hardware devices** with voice input
 - **Remote trigger devices** for hands-free recording
 
-## 📚 Examples
+## Examples
 
 ### Basic Transcription
 
@@ -106,7 +106,7 @@ See the [examples directory](examples/) for complete examples including:
 - Real-time transcription
 - GUI integration patterns
 
-## ⚡ Performance
+## Performance
 
 Tested on M1 MacBook Pro:
 
@@ -118,7 +118,7 @@ Tested on M1 MacBook Pro:
 
 *Latency measured from audio input to text output*
 
-## 🤔 Why memo-stt vs alternatives?
+## Why memo-stt vs alternatives?
 
 | Solution | Setup Time | Privacy | Cost | GPU | Ease of Use |
 |----------|-----------|---------|------|-----|-------------|
@@ -135,7 +135,7 @@ Tested on M1 MacBook Pro:
 - ✅ GPU-accelerated automatically
 - ✅ Works offline (after initial download)
 
-## 📋 Requirements
+## Requirements
 
 - **Rust**: 1.92+
 - **Internet**: Required for first-time model download (~500MB)
@@ -157,7 +157,7 @@ Tested on M1 MacBook Pro:
 - Application context detection captures the active app name and window title
 - On Linux/Windows, `appContext` will return "Unknown"
 
-## 🔧 Model Setup
+## Model Setup
 
 **Models are automatically downloaded on first use!** No manual setup required.
 
@@ -192,7 +192,7 @@ The model names include quantization levels (e.g., `q5_1`, `q8_0`):
 
 For most use cases, Q5_1 provides the best balance of speed and accuracy.
 
-## 📱 BLE Device Support
+## BLE Device Support
 
 memo-stt includes built-in support for Bluetooth Low Energy (BLE) audio devices, enabling wireless voice transcription from hardware buttons or wearable devices.
 
@@ -262,7 +262,7 @@ INPUT_SOURCE=ble cargo run --bin memo-stt
 INPUT_SOURCE=ble_trigger cargo run --bin memo-stt
 ```
 
-## 🖥️ Standalone Binary Application
+## Standalone Binary Application
 
 memo-stt includes a full-featured binary application for hands-free voice transcription with hotkey and BLE device support.
 
@@ -341,7 +341,7 @@ The standalone binary includes additional latency for audio capture and processi
 
 *Tested on M1 MacBook Pro with default model*
 
-## 📖 API Reference
+## API Reference
 
 ### `SttEngine`
 
@@ -357,7 +357,7 @@ The main transcription engine.
 
 See [full documentation](https://docs.rs/memo-stt) for details.
 
-## 🔌 Framework Integrations
+## Framework Integrations
 
 memo-stt works with any Rust framework. Here are some integration patterns:
 
@@ -388,7 +388,7 @@ button.on_click(|| {
 });
 ```
 
-## 🛠️ Audio Format
+## Audio Format
 
 memo-stt expects audio in the following format:
 
@@ -399,15 +399,15 @@ memo-stt expects audio in the following format:
 
 The engine automatically handles resampling if your input sample rate differs from 16kHz.
 
-## 🤝 Contributing
+## Contributing
 
 Contributions welcome! Please feel free to submit a Pull Request.
 
-## 📄 License
+## License
 
 MIT License - see [LICENSE](LICENSE) file for details.
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 Built on top of:
 - [whisper-rs](https://github.com/tazz4843/whisper-rs) - Rust bindings for Whisper
@@ -415,7 +415,5 @@ Built on top of:
 - [OpenAI Whisper](https://github.com/openai/whisper) - The original Whisper model
 
 ---
-
-**Made with ❤️ by the Memo team**
 
 Questions? Open an issue or check the [documentation](https://docs.rs/memo-stt).
