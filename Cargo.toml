@@ -40,6 +40,9 @@ binary = ["cpal", "rdev", "enigo", "audiopus", "anyhow", "log", "btleplug", "tok
 # Whisper STT with Metal GPU acceleration
 whisper-rs = { version = "0.12", features = ["metal"] }
 
+# CPU detection for optimal thread count
+num_cpus = "1.0"
+
 # Model downloading
 ureq = { version = "2.9", default-features = false, features = ["tls"] }
 dirs = "5.0"

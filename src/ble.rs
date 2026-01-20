@@ -32,6 +32,7 @@ pub struct BleAudioReceiver {
     periph: Option<Peripheral>,
     char_audio_data: Option<Characteristic>,
     char_control_tx: Option<Characteristic>,
+    device_name: Option<String>, // Store device name for retrieval
 }
 
 impl BleAudioReceiver {
@@ -41,12 +42,20 @@ impl BleAudioReceiver {
             periph: None,
             char_audio_data: None,
             char_control_tx: None,
+            device_name: None,
         })
     }
 
     /// Scan for and connect to the memo device
-    pub async fn connect(&mut self) -> Result<()> {
-        info!("Scanning for memo device (pattern: {}*)", DEVICE_NAME_PATTERN);
+    /// If preferred_device_name is provided, it will be prioritized during scanning
+    pub async fn connect(&mut self, preferred_device_name: Option<&str>) -> Result<()> {
+        if let Some(pref_name) = preferred_device_name {
+            info!("Scanning for memo device (preferred: {}, pattern: {}*)", pref_name, DEVICE_NAME_PATTERN);
+            eprintln!("🔍 Scanning for BLE device (preferred: {})...", pref_name);
+        } else {
+            info!("Scanning for memo device (pattern: {}*)", DEVICE_NAME_PATTERN);
+            eprintln!("🔍 Scanning for BLE device...");
+        }
 
         let manager = Manager::new().await
             .context("Failed to create BLE manager")?;
@@ -57,64 +66,57 @@ impl BleAudioReceiver {
         let adapter: Adapter = adapter_list.into_iter().next()
             .context("No BLE adapter found")?;
 
-        info!("Starting scan for device");
-        adapter.start_scan(ScanFilter::default()).await
-            .context("Failed to start scan")?;
-
-        let scan_future = async {
-            let mut found_periph: Option<Peripheral> = None;
+        // Device advertises the service UUID - scan for it
+        let service_uuid = Uuid::parse_str(MEMO_AUDIO_SERVICE_UUID)?;
+        adapter.start_scan(ScanFilter::default()).await.context("Failed to start scan")?;
+        
+        let mut found_periph: Option<Peripheral> = None;
+        let start = std::time::Instant::now();
+        
+        while start.elapsed() < SCAN_TIMEOUT {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let peripherals = adapter.peripherals().await?;
             
-            // Scan for up to SCAN_TIMEOUT
-            let start = std::time::Instant::now();
-            while start.elapsed() < SCAN_TIMEOUT {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                
-                let peripherals = adapter.peripherals().await?;
-                debug!("Discovered {} peripherals", peripherals.len());
-                
-                for p in peripherals {
-                    let props_opt = p.properties().await?;
-                    let props = match props_opt {
-                        Some(p) => p,
-                        None => continue,
-                    };
-                    
-                    if let Some(local_name) = &props.local_name {
-                        debug!("Found device: {}", local_name);
-                        if local_name.starts_with(DEVICE_NAME_PATTERN) {
-                            info!("Found target device: {}", local_name);
+            for p in peripherals {
+                if let Ok(Some(props)) = p.properties().await {
+                    // Check for service UUID in advertising data
+                    if props.services.contains(&service_uuid) {
+                        eprintln!("✅ Found device with Memo service");
+                        found_periph = Some(p);
+                        break;
+                    }
+                    // Or check name
+                    if let Some(name) = &props.local_name {
+                        if name.to_lowercase().starts_with(DEVICE_NAME_PATTERN) {
+                            eprintln!("✅ Found: {}", name);
                             found_periph = Some(p);
                             break;
                         }
                     }
-                    // Also check by address
-                    let address = &props.address;
-                    let address_str = format!("{:?}", address).to_uppercase();
-                    if address_str.contains(&DEVICE_ADDRESS.replace("-", "")) {
-                        info!("Found target device by address: {:?}", address);
-                        found_periph = Some(p);
-                        break;
-                    }
-                }
-                
-                if found_periph.is_some() {
-                    break;
                 }
             }
-            
-            adapter.stop_scan().await.ok();
-            found_periph.context("Device not found")
-        };
+            if found_periph.is_some() { break; }
+        }
+        
+        adapter.stop_scan().await.ok();
+        let periph = found_periph.context("Device not found")?;
+        eprintln!("🔌 Connecting...");
 
-        let periph = timeout(SCAN_TIMEOUT, scan_future).await
-            .context("Scan timeout")?
-            .context("Device not found")?;
+        // Connect
+        timeout(Duration::from_secs(10), periph.connect())
+            .await
+            .context("Connection timeout")?
+            .context("Failed to connect")?;
 
-        info!("Connecting to device...");
-        periph.connect().await
-            .context("Failed to connect to device")?;
-
-        info!("Connected! Discovering services...");
+        // Get device name
+        let device_name = periph.properties().await
+            .ok()
+            .flatten()
+            .and_then(|props| props.local_name.clone())
+            .unwrap_or_else(|| "Unknown".to_string());
+        self.device_name = Some(device_name.clone());
+        
+        eprintln!("✅ Connected: {}", device_name);
         periph.discover_services().await
             .context("Failed to discover services")?;
 
@@ -191,6 +193,20 @@ impl BleAudioReceiver {
         }
 
         self.periph = Some(periph);
+        
+        // Output device name when connection is complete (for Electron to capture)
+        if let Some(ref periph) = self.periph {
+            if let Ok(Some(props)) = periph.properties().await {
+                if let Some(ref local_name) = props.local_name {
+                    info!("✅ BLE device connected: {}", local_name);
+                } else {
+                    info!("✅ BLE device connected");
+                }
+            } else {
+                info!("✅ BLE device connected");
+            }
+        }
+        
         Ok(())
     }
 
@@ -206,8 +222,15 @@ impl BleAudioReceiver {
     
     /// Connect in trigger-only mode (only subscribes to Control TX, not Audio Data)
     /// This allows using BLE device as a remote trigger while audio comes from system mic
-    pub async fn connect_trigger_only(&mut self) -> Result<()> {
-        info!("Scanning for memo device (trigger-only mode)...");
+    /// If preferred_device_name is provided, it will be prioritized during scanning
+    pub async fn connect_trigger_only(&mut self, preferred_device_name: Option<&str>) -> Result<()> {
+        if let Some(pref_name) = preferred_device_name {
+            info!("Scanning for memo device (trigger-only mode, preferred: {})...", pref_name);
+            eprintln!("🔍 Scanning for BLE device (trigger-only, preferred: {})...", pref_name);
+        } else {
+            info!("Scanning for memo device (trigger-only mode)...");
+            eprintln!("🔍 Scanning for BLE device (trigger-only)...");
+        }
 
         let manager = Manager::new().await
             .context("Failed to create BLE manager")?;
@@ -218,61 +241,55 @@ impl BleAudioReceiver {
         let adapter: Adapter = adapter_list.into_iter().next()
             .context("No BLE adapter found")?;
 
-        info!("Starting scan for device");
-        adapter.start_scan(ScanFilter::default()).await
-            .context("Failed to start scan")?;
-
-        let scan_future = async {
-            let mut found_periph: Option<Peripheral> = None;
+        // Device advertises the service UUID - scan for it
+        let service_uuid = Uuid::parse_str(MEMO_AUDIO_SERVICE_UUID)?;
+        adapter.start_scan(ScanFilter::default()).await.context("Failed to start scan")?;
+        
+        let mut found_periph: Option<Peripheral> = None;
+        let start = std::time::Instant::now();
+        
+        while start.elapsed() < SCAN_TIMEOUT {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let peripherals = adapter.peripherals().await?;
             
-            let start = std::time::Instant::now();
-            while start.elapsed() < SCAN_TIMEOUT {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                
-                let peripherals = adapter.peripherals().await?;
-                debug!("Discovered {} peripherals", peripherals.len());
-                
-                for p in peripherals {
-                    let props_opt = p.properties().await?;
-                    let props = match props_opt {
-                        Some(p) => p,
-                        None => continue,
-                    };
-                    
-                    if let Some(local_name) = &props.local_name {
-                        if local_name.starts_with(DEVICE_NAME_PATTERN) {
-                            info!("Found target device: {}", local_name);
+            for p in peripherals {
+                if let Ok(Some(props)) = p.properties().await {
+                    // Check for service UUID in advertising data
+                    if props.services.contains(&service_uuid) {
+                        eprintln!("✅ Found device with Memo service");
+                        found_periph = Some(p);
+                        break;
+                    }
+                    // Or check name
+                    if let Some(name) = &props.local_name {
+                        if name.to_lowercase().starts_with(DEVICE_NAME_PATTERN) {
+                            eprintln!("✅ Found: {}", name);
                             found_periph = Some(p);
                             break;
                         }
                     }
-                    let address = &props.address;
-                    let address_str = format!("{:?}", address).to_uppercase();
-                    if address_str.contains(&DEVICE_ADDRESS.replace("-", "")) {
-                        info!("Found target device by address: {:?}", address);
-                        found_periph = Some(p);
-                        break;
-                    }
-                }
-                
-                if found_periph.is_some() {
-                    break;
                 }
             }
-            
-            adapter.stop_scan().await.ok();
-            found_periph.context("Device not found")
-        };
+            if found_periph.is_some() { break; }
+        }
+        
+        adapter.stop_scan().await.ok();
+        let periph = found_periph.context("Device not found")?;
+        eprintln!("🔌 Connecting...");
+        
+        timeout(Duration::from_secs(10), periph.connect())
+            .await
+            .context("Connection timeout")?
+            .context("Failed to connect")?;
 
-        let periph = timeout(SCAN_TIMEOUT, scan_future).await
-            .context("Scan timeout")?
-            .context("Device not found")?;
-
-        info!("Connecting to device (trigger-only mode)...");
-        periph.connect().await
-            .context("Failed to connect to device")?;
-
-        info!("Connected! Discovering services...");
+        let device_name = periph.properties().await
+            .ok()
+            .flatten()
+            .and_then(|props| props.local_name.clone())
+            .unwrap_or_else(|| "Unknown".to_string());
+        self.device_name = Some(device_name.clone());
+        
+        eprintln!("✅ Connected: {}", device_name);
         periph.discover_services().await
             .context("Failed to discover services")?;
 
@@ -319,7 +336,35 @@ impl BleAudioReceiver {
         }
 
         self.periph = Some(periph);
+        
+        // Output device name when connection is complete (for Electron to capture)
+        // Use the stored device name if available
+        if let Some(ref name) = self.device_name {
+            eprintln!("✅ BLE device connected: {}", name);
+        } else {
+            // Fallback: try to get from peripheral
+            if let Some(ref periph) = self.periph {
+                if let Ok(Some(props)) = periph.properties().await {
+                    if let Some(ref local_name) = props.local_name {
+                        self.device_name = Some(local_name.clone());
+                        eprintln!("✅ BLE device connected: {}", local_name);
+                    } else {
+                        eprintln!("✅ BLE device connected");
+                    }
+                } else {
+                    eprintln!("✅ BLE device connected");
+                }
+            } else {
+                eprintln!("✅ BLE device connected");
+            }
+        }
+        
         Ok(())
+    }
+    
+    /// Get the device name if available
+    pub fn device_name(&self) -> Option<&String> {
+        self.device_name.as_ref()
     }
     
     /// Process a notification and return the appropriate result
@@ -351,6 +396,36 @@ impl BleAudioReceiver {
     /// Check if connected
     pub fn is_connected(&self) -> bool {
         self.periph.is_some()
+    }
+
+    /// Check if the connection is still alive by attempting to read properties
+    /// Returns true if still connected, false if disconnected
+    pub async fn check_connection_health(&self) -> bool {
+        if let Some(ref periph) = self.periph {
+            // Try to get properties with a timeout - if this fails or times out, the device is likely disconnected
+            // Use a shorter timeout (1 second) to detect disconnections faster
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                periph.properties()
+            ).await {
+                Ok(Ok(props)) => {
+                    // Properties retrieved successfully
+                    // Additional check: verify the peripheral still has a valid connection
+                    // by checking if properties contain expected fields
+                    props.is_some()
+                }
+                Ok(Err(_)) => {
+                    debug!("Connection health check: properties() failed");
+                    false
+                }
+                Err(_) => {
+                    debug!("Connection health check: properties() timed out - device likely disconnected");
+                    false
+                }
+            }
+        } else {
+            false
+        }
     }
 
     /// Disconnect from device

@@ -20,6 +20,46 @@ mod ble;
 #[cfg(feature = "binary")]
 mod opus_decoder;
 
+/// Strip periods from phrases or sentences that are less than 4 words long
+fn strip_periods_from_short_phrases(text: &str) -> String {
+    // Split by common sentence delimiters (period, exclamation, question mark)
+    let mut result = String::new();
+    let mut current_phrase = String::new();
+    
+    for ch in text.chars() {
+        if ch == '.' || ch == '!' || ch == '?' {
+            // End of a phrase/sentence
+            let phrase = current_phrase.trim();
+            if !phrase.is_empty() {
+                // Count words in the phrase
+                let word_count = phrase.split_whitespace().count();
+                
+                if word_count < 4 {
+                    // Strip the period for short phrases
+                    result.push_str(&phrase);
+                    // Don't add the period
+                } else {
+                    // Keep the period for longer phrases
+                    result.push_str(&phrase);
+                    result.push(ch);
+                }
+                result.push(' ');
+            }
+            current_phrase.clear();
+        } else {
+            current_phrase.push(ch);
+        }
+    }
+    
+    // Handle any remaining text (no trailing punctuation)
+    if !current_phrase.trim().is_empty() {
+        let phrase = current_phrase.trim();
+        result.push_str(&phrase);
+    }
+    
+    result.trim().to_string()
+}
+
 // Calculate audio levels for waveform visualization
 // Returns 7 normalized levels (0.0-1.0) for the 7 bars
 fn calculate_audio_levels(samples: &[i16]) -> Vec<f32> {
@@ -199,15 +239,29 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>) -> Result<(), Box<dyn
     
     println!("Starting BLE audio mode...");
     
-    // Initialize Opus decoder
+    // Initialize Opus decoder (preserved during reconnection)
     let mut decoder = OpusDecoder::new(16000, 20)?;
     
     // Initialize BLE receiver
     let mut ble_receiver = BleAudioReceiver::new().await?;
     
-    // Connect to device
+    // Get preferred device name from environment variable
+    let preferred_device_name = std::env::var("MEMO_DEVICE_NAME")
+        .ok()
+        .filter(|s| !s.is_empty() && s.to_lowercase().starts_with("memo_"));
+    
+    if let Some(ref name) = preferred_device_name {
+        println!("Using preferred device: {}", name);
+    }
+    
+    // Reconnection state (preserved across reconnection attempts)
+    let mut reconnect_attempts = 0u32;
+    const RECONNECT_DELAY_BASE: u64 = 2; // seconds
+    const RECONNECT_DELAY_MAX: u64 = 30; // seconds
+    
+    // Connect to device (initial connection)
     println!("Connecting to memo device...");
-    if let Err(e) = ble_receiver.connect().await {
+    if let Err(e) = ble_receiver.connect(preferred_device_name.as_deref()).await {
         eprintln!("Failed to connect to BLE device: {}", e);
         eprintln!("Falling back to system microphone...");
         // Don't exit - fall back to system mic mode instead
@@ -215,18 +269,67 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>) -> Result<(), Box<dyn
         return Err(e.into());
     }
     
+    // Device name is already printed by ble_receiver.connect() via eprintln!
     println!("Connected! Waiting for button press to start recording...");
     
+    // State that persists across reconnections (preserved during reconnection)
     let engine_clone = engine.clone();
     let performance_history: Arc<Mutex<VecDeque<(f32, f32)>>> = Arc::new(Mutex::new(VecDeque::with_capacity(10)));
     let press_enter_after_paste = Arc::new(AtomicBool::new(false));
     let is_recording = Arc::new(AtomicBool::new(false));
     let audio_buffer = Arc::new(Mutex::new(Vec::<i16>::new()));
     
+    // Vocabulary storage for voice commands
+    #[derive(Clone)]
+    struct Vocabulary {
+        apps: Vec<String>,
+        commands: Vec<String>,
+    }
+    
+    let vocabulary = Arc::new(Mutex::new(Vocabulary {
+        apps: Vec::new(),
+        commands: Vec::new(),
+    }));
+    
+    // Helper function to build combined prompt with app context and vocabulary
+    let build_prompt = |app_name: String, window_title: String, vocab: &Vocabulary| -> Option<String> {
+        let mut parts = Vec::new();
+        
+        // Add app context
+        if !app_name.is_empty() && app_name != "Unknown" {
+            if !window_title.is_empty() {
+                parts.push(format!("You are transcribing for {}. The current window is: {}.", app_name, window_title));
+            } else {
+                parts.push(format!("You are transcribing for {}.", app_name));
+            }
+        }
+        
+        // Add vocabulary for voice commands
+        if !vocab.apps.is_empty() || !vocab.commands.is_empty() {
+            let mut vocab_parts = Vec::new();
+            if !vocab.apps.is_empty() {
+                vocab_parts.push(format!("Voice commands: open {}.", vocab.apps.join(", ")));
+            }
+            if !vocab.commands.is_empty() {
+                vocab_parts.push(format!("Commands: {}.", vocab.commands.join(", ")));
+            }
+            if !vocab_parts.is_empty() {
+                parts.push(vocab_parts.join(" "));
+            }
+        }
+        
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" "))
+        }
+    };
+    
     // Spawn thread to read commands from stdin
     let press_enter_clone = press_enter_after_paste.clone();
     let input_source = Arc::new(Mutex::new(String::from("ble")));
     let input_source_clone = input_source.clone();
+    let vocabulary_clone = vocabulary.clone();
     std::thread::spawn(move || {
         use std::io::{self, BufRead};
         let stdin = io::stdin();
@@ -243,6 +346,22 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>) -> Result<(), Box<dyn
                         *input_source_clone.lock().unwrap() = source;
                         eprintln!("MIC: Input source changed to: {}", source_clone);
                     }
+                } else if let Some(value) = cmd.strip_prefix("VOCAB:") {
+                    // Parse vocabulary JSON: {"apps": [...], "commands": [...]}
+                    if let Ok(vocab_json) = serde_json::from_str::<serde_json::Value>(value.trim()) {
+                        let mut vocab = vocabulary_clone.lock().unwrap();
+                        vocab.apps = vocab_json.get("apps")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                            .unwrap_or_default();
+                        vocab.commands = vocab_json.get("commands")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                            .unwrap_or_default();
+                        eprintln!("MIC: Vocabulary updated: {} apps, {} commands", vocab.apps.len(), vocab.commands.len());
+                    } else {
+                        eprintln!("MIC: Failed to parse VOCAB command");
+                    }
                 }
             }
         }
@@ -254,19 +373,48 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>) -> Result<(), Box<dyn
     let last_audio_level_sent = Arc::new(Mutex::new(Instant::now()));
     let last_audio_level_sent_clone = last_audio_level_sent.clone();
     
-    // Get the notification stream once and process it
-    let mut notifications = match ble_receiver.notifications().await {
-        Ok(stream) => stream,
-        Err(e) => {
-            eprintln!("Failed to get notification stream: {}", e);
-            return Err(e.into());
-        }
-    };
-    
     use ble::NotificationResult;
     use futures::StreamExt;
     use tokio::time::timeout;
     
+    // Helper function for reconnection logic
+    async fn attempt_reconnect(
+        ble_receiver: &mut BleAudioReceiver,
+        reconnect_attempts: &mut u32,
+        preferred_device_name: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        eprintln!("BLE device disconnected");
+        ble_receiver.disconnect().await.ok();
+        
+        // Calculate exponential backoff delay
+        let attempts_capped = (*reconnect_attempts).min(4); // Cap at 4 for 2^4 = 16 multiplier
+        let delay_seconds = std::cmp::min(
+            RECONNECT_DELAY_BASE * (1u64 << attempts_capped),
+            RECONNECT_DELAY_MAX
+        );
+        
+        *reconnect_attempts += 1;
+        eprintln!("Attempting to reconnect to BLE device in {} seconds (attempt {})...", delay_seconds, reconnect_attempts);
+        
+        // Wait for backoff delay
+        tokio::time::sleep(tokio::time::Duration::from_secs(delay_seconds)).await;
+        
+        // Attempt to reconnect with preferred device name
+        match ble_receiver.connect(preferred_device_name).await {
+            Ok(()) => {
+                // Device name is already printed by ble_receiver.connect() via eprintln!
+                println!("Reconnected! Waiting for button press to start recording...");
+                *reconnect_attempts = 0; // Reset on successful reconnection
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("Failed to reconnect to BLE device: {}", e);
+                Err(e.into())
+            }
+        }
+    }
+    
+    // Outer loop for reconnection handling
     loop {
         // Check if input source changed
         {
@@ -277,241 +425,311 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>) -> Result<(), Box<dyn
             }
         }
         
-        // Receive notifications (audio or control events) with timeout
-        match timeout(tokio::time::Duration::from_millis(100), notifications.next()).await {
-            Ok(Some(notification)) => {
-                // Process the notification
-                match ble_receiver.process_notification(notification) {
-                    NotificationResult::Control(0x01) => {
-                // RESP_SPEECH_START - Button pressed, start recording
-                if !is_recording_clone.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                    continue; // Already recording
+        // Get the notification stream
+        let mut notifications = match ble_receiver.notifications().await {
+            Ok(stream) => stream,
+            Err(e) => {
+                eprintln!("Failed to get notification stream: {}", e);
+                // Attempt reconnection and continue outer loop
+                if attempt_reconnect(&mut ble_receiver, &mut reconnect_attempts, preferred_device_name.as_deref()).await.is_ok() {
+                    continue; // Successfully reconnected, get new stream
+                } else {
+                    continue; // Reconnection failed, retry with longer backoff
                 }
-                println!("🎤 Recording... (button pressed)");
-                audio_buffer_clone.lock().unwrap().clear();
             }
-                    NotificationResult::Control(0x02) => {
-                // RESP_SPEECH_END - Button pressed again, stop recording and transcribe
-                if !is_recording_clone.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                    continue; // Not recording
+        };
+        
+        // Inner loop: process notifications with connection monitoring
+        let mut connection_check_interval = tokio::time::interval(tokio::time::Duration::from_secs(3));
+        connection_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        
+        loop {
+            // Check if input source changed
+            {
+                let source = input_source.lock().unwrap();
+                if *source != "ble" {
+                    println!("Input source changed to {}, exiting BLE mode", source);
+                    return Ok(());
+                }
+            }
+            
+            // Use select! to monitor both notifications and connection health
+            tokio::select! {
+                // Check connection health periodically
+                _ = connection_check_interval.tick() => {
+                    if !ble_receiver.check_connection_health().await {
+                        eprintln!("BLE device disconnected (connection health check failed)");
+                        break; // Break inner loop to attempt reconnection
+                    }
                 }
                 
-                // Get the buffered audio
-                let samples = {
-                    let mut buf = audio_buffer_clone.lock().unwrap();
-                    std::mem::take(&mut *buf)
-                };
-                
-                if !samples.is_empty() {
-                    println!("⏹️  Stopped ({} samples, {:.2}s)", samples.len(), samples.len() as f32 / 16000.0);
-                    
-                    // Encode audio to OPUS for saving
-                    let samples_for_encoding = samples.clone();
-                    let audio_duration = samples.len() as f32 / 16000.0;
-                    
-                    // Encode in a separate thread to avoid blocking transcription
-                    std::thread::spawn(move || {
-                        use opus_decoder::OpusEncoder;
-                        #[cfg(feature = "binary")]
-                        use base64::{Engine as _, engine::general_purpose::STANDARD};
-                        
-                        match OpusEncoder::new(16000, 20) {
-                            Ok(mut encoder_for_thread) => {
-                                match encoder_for_thread.encode_buffer(&samples_for_encoding) {
-                                    Ok(opus_data) => {
-                                        #[cfg(feature = "binary")]
-                                        {
-                                            let base64_data = STANDARD.encode(&opus_data);
-                                            println!("AUDIO_DATA:{}", base64_data);
-                                            println!("AUDIO_DURATION:{:.2}", audio_duration);
-                                            
-                                            // Also output WAV data for easy playback
-                                            // WAV format: 44-byte header + PCM data
-                                            let sample_rate = 16000u32;
-                                            let channels = 1u16;
-                                            let bits_per_sample = 16u16;
-                                            let pcm_data_len = samples_for_encoding.len() * 2; // 16-bit = 2 bytes per sample
-                                            let wav_size = 44 + pcm_data_len;
-                                            
-                                            let mut wav_data = Vec::with_capacity(wav_size);
-                                            // RIFF header
-                                            wav_data.extend_from_slice(b"RIFF");
-                                            wav_data.extend_from_slice(&(36u32 + pcm_data_len as u32).to_le_bytes());
-                                            wav_data.extend_from_slice(b"WAVE");
-                                            // fmt chunk
-                                            wav_data.extend_from_slice(b"fmt ");
-                                            wav_data.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
-                                            wav_data.extend_from_slice(&1u16.to_le_bytes()); // audio format (PCM)
-                                            wav_data.extend_from_slice(&channels.to_le_bytes());
-                                            wav_data.extend_from_slice(&sample_rate.to_le_bytes());
-                                            wav_data.extend_from_slice(&(sample_rate as u32 * channels as u32 * (bits_per_sample as u32 / 8)).to_le_bytes()); // byte rate
-                                            wav_data.extend_from_slice(&(channels * (bits_per_sample / 8)).to_le_bytes()); // block align
-                                            wav_data.extend_from_slice(&bits_per_sample.to_le_bytes());
-                                            // data chunk
-                                            wav_data.extend_from_slice(b"data");
-                                            wav_data.extend_from_slice(&(pcm_data_len as u32).to_le_bytes());
-                                            // PCM data (16-bit little-endian)
-                                            for &sample in &samples_for_encoding {
-                                                wav_data.extend_from_slice(&sample.to_le_bytes());
-                                            }
-                                            
-                                            let wav_base64 = STANDARD.encode(&wav_data);
-                                            println!("AUDIO_WAV:{}", wav_base64);
-                                        }
+                // Receive notifications (audio or control events) with timeout
+                result = timeout(tokio::time::Duration::from_millis(100), notifications.next()) => {
+                    match result {
+                        Ok(Some(notification)) => {
+                            // Process the notification
+                            match ble_receiver.process_notification(notification) {
+                                NotificationResult::Control(0x01) => {
+                                    // RESP_SPEECH_START - Button pressed, start recording
+                                    if !is_recording_clone.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                                        continue; // Already recording
                                     }
-                                    Err(e) => {
-                                        eprintln!("Failed to encode audio: {}", e);
-                                    }
+                                    println!("🎤 Recording... (button pressed)");
+                                    audio_buffer_clone.lock().unwrap().clear();
                                 }
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to create Opus encoder: {}", e);
-                            }
-                        }
-                    });
-                    
-                    // Spawn transcription thread
-                    let engine_for_thread = engine_clone.clone();
-                    let perf_history = performance_history.clone();
-                    let press_enter_clone = press_enter_after_paste.clone();
-                    let sample_count = samples.len();
-                    let audio_duration = sample_count as f32 / 16000.0;
-                    
-                    std::thread::spawn(move || {
-                        println!("🔄 Transcribing...");
-                        let mut eng = engine_for_thread.lock().unwrap();
-                        
-                        // Capture application context
-                        let (app_name, window_title) = app_detection::get_application_context();
-                        let prompt = if !app_name.is_empty() && app_name != "Unknown" {
-                            if !window_title.is_empty() {
-                                format!("You are transcribing for {}. The current window is: {}.", app_name, window_title)
-                            } else {
-                                format!("You are transcribing for {}.", app_name)
-                            }
-                        } else {
-                            String::new()
-                        };
-                        eng.set_prompt(if prompt.is_empty() { None } else { Some(prompt) });
-                        
-                        let transcribe_start = Instant::now();
-                        match eng.transcribe(&samples) {
-                            Ok(text) => {
-                                let transcribe_time = transcribe_start.elapsed();
-                                let realtime_factor = audio_duration / transcribe_time.as_secs_f32();
-                                
-                                // Update performance history
-                                {
-                                    let mut history = perf_history.lock().unwrap();
-                                    history.push_back((audio_duration, realtime_factor));
-                                    if history.len() > 10 {
-                                        history.pop_front();
+                                NotificationResult::Control(0x02) => {
+                                    // RESP_SPEECH_END - Button pressed again, stop recording and transcribe
+                                    if !is_recording_clone.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                                        continue; // Not recording
                                     }
-                                }
-                                
-                                if text.trim().is_empty() {
-                                    println!("📝 (no speech detected)");
-                                } else {
-                                    let (app_name, window_title) = app_detection::get_application_context();
-                                    let json_output = json!({
-                                        "rawTranscript": text,
-                                        "processedText": text,
-                                        "wasProcessedByLLM": false,
-                                        "appContext": {
-                                            "appName": app_name,
-                                            "windowTitle": window_title
-                                        }
-                                    });
-                                    println!("FINAL: {}", json_output);
                                     
-                                    let press_enter = press_enter_clone.load(Ordering::Acquire);
-                                    match inject_text(&text, press_enter) {
-                                        Ok(_) => {
-                                            println!("📝 {}", text);
-                                            println!("✅ Injected");
+                                    // Get the buffered audio
+                                    let samples = {
+                                        let mut buf = audio_buffer_clone.lock().unwrap();
+                                        std::mem::take(&mut *buf)
+                                    };
+                                    
+                                    if !samples.is_empty() {
+                                        println!("⏹️  Stopped ({} samples, {:.2}s)", samples.len(), samples.len() as f32 / 16000.0);
+                                        
+                                        // Encode audio to OPUS for saving
+                                        let samples_for_encoding = samples.clone();
+                                        let audio_duration = samples.len() as f32 / 16000.0;
+                                        
+                                        // Encode in a separate thread to avoid blocking transcription
+                                        std::thread::spawn(move || {
+                            use opus_decoder::OpusEncoder;
+                            #[cfg(feature = "binary")]
+                            use base64::{Engine as _, engine::general_purpose::STANDARD};
+                            
+                            match OpusEncoder::new(16000, 20) {
+                                Ok(mut encoder_for_thread) => {
+                                    match encoder_for_thread.encode_buffer(&samples_for_encoding) {
+                                        Ok(opus_data) => {
+                                            #[cfg(feature = "binary")]
+                                            {
+                                                let base64_data = STANDARD.encode(&opus_data);
+                                                println!("AUDIO_DATA:{}", base64_data);
+                                                println!("AUDIO_DURATION:{:.2}", audio_duration);
+                                                
+                                                // Also output WAV data for easy playback
+                                                // WAV format: 44-byte header + PCM data
+                                                let sample_rate = 16000u32;
+                                                let channels = 1u16;
+                                                let bits_per_sample = 16u16;
+                                                let pcm_data_len = samples_for_encoding.len() * 2; // 16-bit = 2 bytes per sample
+                                                let wav_size = 44 + pcm_data_len;
+                                                
+                                                let mut wav_data = Vec::with_capacity(wav_size);
+                                                // RIFF header
+                                                wav_data.extend_from_slice(b"RIFF");
+                                                wav_data.extend_from_slice(&(36u32 + pcm_data_len as u32).to_le_bytes());
+                                                wav_data.extend_from_slice(b"WAVE");
+                                                // fmt chunk
+                                                wav_data.extend_from_slice(b"fmt ");
+                                                wav_data.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+                                                wav_data.extend_from_slice(&1u16.to_le_bytes()); // audio format (PCM)
+                                                wav_data.extend_from_slice(&channels.to_le_bytes());
+                                                wav_data.extend_from_slice(&sample_rate.to_le_bytes());
+                                                wav_data.extend_from_slice(&(sample_rate as u32 * channels as u32 * (bits_per_sample as u32 / 8)).to_le_bytes()); // byte rate
+                                                wav_data.extend_from_slice(&(channels * (bits_per_sample / 8)).to_le_bytes()); // block align
+                                                wav_data.extend_from_slice(&bits_per_sample.to_le_bytes());
+                                                // data chunk
+                                                wav_data.extend_from_slice(b"data");
+                                                wav_data.extend_from_slice(&(pcm_data_len as u32).to_le_bytes());
+                                                // PCM data (16-bit little-endian)
+                                                for &sample in &samples_for_encoding {
+                                                    wav_data.extend_from_slice(&sample.to_le_bytes());
+                                                }
+                                                
+                                                let wav_base64 = STANDARD.encode(&wav_data);
+                                                println!("AUDIO_WAV:{}", wav_base64);
+                                            }
                                         }
                                         Err(e) => {
-                                            println!("📝 {}", text);
-                                            eprintln!("❌ Injection failed: {}", e);
+                                            eprintln!("Failed to encode audio: {}", e);
                                         }
                                     }
                                 }
+                                Err(e) => {
+                                    eprintln!("Failed to create Opus encoder: {}", e);
+                                }
                             }
-                            Err(e) => {
-                                eprintln!("❌ Error: {}", e);
-                            }
-                        }
-                    });
-                } else {
-                    println!("⏹️  Stopped (no audio captured)");
-                }
-            }
-                    NotificationResult::Audio(audio_data) => {
-                // Only process audio if we're recording
-                if !is_recording_clone.load(Ordering::Acquire) {
-                    continue;
-                }
-                
-                if audio_data.is_empty() {
-                    continue;
-                }
-                
-                // Parse packet: [bundle_index:1][num_frames:1][frame1_size:1][frame1_data:N]...
-                // Format from firmware: bundle_index (1 byte) + bundled data
-                if audio_data.len() < 2 {
-                    continue;
-                }
-                
-                // Extract bundle data (skip 1-byte bundle_index header)
-                let bundle_index = audio_data[0];
-                let bundle_data = &audio_data[1..];
-                
-                debug!("Received audio packet: bundle_index={}, size={} bytes", bundle_index, audio_data.len());
-                
-                // Decode Opus bundle to PCM
-                match decoder.decode_bundle(bundle_data) {
-                    Ok(pcm_samples) => {
-                        if !pcm_samples.is_empty() {
-                            // Add to buffer while recording
-                            audio_buffer_clone.lock().unwrap().extend_from_slice(&pcm_samples);
+                        });
+                        
+                        // Spawn transcription thread
+                        let engine_for_thread = engine_clone.clone();
+                        let perf_history = performance_history.clone();
+                        let press_enter_clone = press_enter_after_paste.clone();
+                        let vocabulary_for_thread = vocabulary.clone();
+                        let sample_count = samples.len();
+                        let audio_duration = sample_count as f32 / 16000.0;
+                        
+                        std::thread::spawn(move || {
+                            println!("🔄 Transcribing...");
+                            let mut eng = engine_for_thread.lock().unwrap();
                             
-                            // Calculate and send audio levels for waveform visualization (BLE with reduced sensitivity)
-                            if is_recording_clone.load(Ordering::Acquire) {
-                                let levels = calculate_audio_levels_ble(&pcm_samples);
-                                let mut last_sent = last_audio_level_sent_clone.lock().unwrap();
-                                // Throttle to ~20fps (50ms intervals)
-                                if last_sent.elapsed().as_millis() >= 50 {
-                                    let json = json!(levels).to_string();
-                                    println!("AUDIO_LEVELS:{}", json);
-                                    *last_sent = Instant::now();
+                            // Capture application context and vocabulary
+                            let (app_name, window_title) = app_detection::get_application_context();
+                            let vocab = vocabulary_for_thread.lock().unwrap();
+                            let prompt = build_prompt(app_name, window_title, &vocab);
+                            eng.set_prompt(prompt);
+                            
+                            let transcribe_start = Instant::now();
+                            match eng.transcribe(&samples) {
+                                Ok(text) => {
+                                    let transcribe_time = transcribe_start.elapsed();
+                                    let realtime_factor = audio_duration / transcribe_time.as_secs_f32();
+                                    
+                                    // Update performance history
+                                    {
+                                        let mut history = perf_history.lock().unwrap();
+                                        history.push_back((audio_duration, realtime_factor));
+                                        if history.len() > 10 {
+                                            history.pop_front();
+                                        }
+                                    }
+                                    
+                                    if text.trim().is_empty() {
+                                        println!("📝 (no speech detected)");
+                                    } else {
+                                        let (app_name, window_title) = app_detection::get_application_context();
+                                        let processed_text = strip_periods_from_short_phrases(&text);
+                                        let json_output = json!({
+                                            "rawTranscript": text,
+                                            "processedText": processed_text,
+                                            "wasProcessedByLLM": false,
+                                            "appContext": {
+                                                "appName": app_name,
+                                                "windowTitle": window_title
+                                            }
+                                        });
+                                        println!("FINAL: {}", json_output);
+                                        
+                                        let press_enter = press_enter_clone.load(Ordering::Acquire);
+                                        match inject_text(&processed_text, press_enter) {
+                                            Ok(_) => {
+                                                println!("📝 {}", text);
+                                                println!("✅ Injected");
+                                            }
+                                            Err(e) => {
+                                                println!("📝 {}", text);
+                                                eprintln!("❌ Injection failed: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("❌ Error: {}", e);
+                                }
+                            }
+                        });
+                                    } else {
+                                        println!("⏹️  Stopped (no audio captured)");
+                                    }
+                                }
+                                NotificationResult::Audio(audio_data) => {
+                                    // Only process audio if we're recording
+                                    if !is_recording_clone.load(Ordering::Acquire) {
+                                        continue;
+                                    }
+                                    
+                                    if audio_data.is_empty() {
+                                        continue;
+                                    }
+                                    
+                                    // Parse packet: [bundle_index:1][num_frames:1][frame1_size:1][frame1_data:N]...
+                                    // Format from firmware: bundle_index (1 byte) + bundled data
+                                    if audio_data.len() < 2 {
+                                        continue;
+                                    }
+                                    
+                                    // Extract bundle data (skip 1-byte bundle_index header)
+                                    let bundle_index = audio_data[0];
+                                    let bundle_data = &audio_data[1..];
+                                    
+                                    debug!("Received audio packet: bundle_index={}, size={} bytes", bundle_index, audio_data.len());
+                                    
+                                    // Decode Opus bundle to PCM
+                                    match decoder.decode_bundle(bundle_data) {
+                                        Ok(pcm_samples) => {
+                                            if !pcm_samples.is_empty() {
+                                                // Add to buffer while recording
+                                                audio_buffer_clone.lock().unwrap().extend_from_slice(&pcm_samples);
+                                                
+                                                // Calculate and send audio levels for waveform visualization (BLE with reduced sensitivity)
+                                                if is_recording_clone.load(Ordering::Acquire) {
+                                                    let levels = calculate_audio_levels_ble(&pcm_samples);
+                                                    let mut last_sent = last_audio_level_sent_clone.lock().unwrap();
+                                                    // Throttle to ~20fps (50ms intervals)
+                                                    if last_sent.elapsed().as_millis() >= 50 {
+                                                        let json = json!(levels).to_string();
+                                                        println!("AUDIO_LEVELS:{}", json);
+                                                        *last_sent = Instant::now();
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Opus decode error: {}", e);
+                                        }
+                                    }
+                                }
+                                NotificationResult::Control(_) => {
+                                    // Other control events, ignore (already handled above)
+                                }
+                                NotificationResult::None => {
+                                    // Not a notification we care about
                                 }
                             }
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("Opus decode error: {}", e);
-                    }
-                }
-                    }
-                    NotificationResult::Control(_) => {
-                        // Other control events, ignore (already handled above)
-                    }
-                    NotificationResult::None => {
-                        // Not a notification we care about
+                        Ok(None) => {
+                            // Stream ended - attempt reconnection
+                            eprintln!("BLE notification stream ended");
+                            break; // Break inner loop to attempt reconnection
+                        }
+                        Err(_) => {
+                            // Timeout - no notification available, continue loop
+                        }
                     }
                 }
             }
-            Ok(None) => {
-                // Stream ended
-                eprintln!("Notification stream ended");
-                break;
+        }
+        
+        // Reconnection logic: stream ended or failed to get stream
+        eprintln!("BLE device disconnected");
+        
+        // Clean up existing connection
+        ble_receiver.disconnect().await.ok();
+        
+        // Calculate exponential backoff delay
+        let attempts_capped = reconnect_attempts.min(4); // Cap at 4 for 2^4 = 16 multiplier
+        let delay_seconds = std::cmp::min(
+            RECONNECT_DELAY_BASE * (1u64 << attempts_capped),
+            RECONNECT_DELAY_MAX
+        );
+        
+        reconnect_attempts += 1;
+        eprintln!("Attempting to reconnect to BLE device in {} seconds (attempt {})...", delay_seconds, reconnect_attempts);
+        
+        // Wait for backoff delay
+        tokio::time::sleep(tokio::time::Duration::from_secs(delay_seconds)).await;
+        
+        // Attempt to reconnect with preferred device name
+        match ble_receiver.connect(preferred_device_name.as_deref()).await {
+            Ok(()) => {
+                // Device name is already printed by ble_receiver.connect() via eprintln!
+                println!("Reconnected! Waiting for button press to start recording...");
+                reconnect_attempts = 0; // Reset on successful reconnection
             }
-            Err(_) => {
-                // Timeout - no notification available, continue loop
+            Err(e) => {
+                eprintln!("Failed to reconnect to BLE device: {}", e);
+                // Continue outer loop to retry with longer backoff
             }
         }
     }
     
+    // Clean up on exit
     ble_receiver.disconnect().await.ok();
     Ok(())
 }
@@ -654,10 +872,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }).ok();
     });
     
-    // Spawn thread to read commands from stdin (for ENTER:<0|1> and INPUT_SOURCE:<system|ble> commands)
+    // Vocabulary storage for voice commands
+    #[derive(Clone)]
+    struct Vocabulary {
+        apps: Vec<String>,
+        commands: Vec<String>,
+    }
+    
+    let vocabulary = Arc::new(Mutex::new(Vocabulary {
+        apps: Vec::new(),
+        commands: Vec::new(),
+    }));
+    
+    // Helper function to build combined prompt with app context and vocabulary
+    let build_prompt = |app_name: String, window_title: String, vocab: &Vocabulary| -> Option<String> {
+        let mut parts = Vec::new();
+        
+        // Add app context
+        if !app_name.is_empty() && app_name != "Unknown" {
+            if !window_title.is_empty() {
+                parts.push(format!("You are transcribing for {}. The current window is: {}.", app_name, window_title));
+            } else {
+                parts.push(format!("You are transcribing for {}.", app_name));
+            }
+        }
+        
+        // Add vocabulary for voice commands
+        if !vocab.apps.is_empty() || !vocab.commands.is_empty() {
+            let mut vocab_parts = Vec::new();
+            if !vocab.apps.is_empty() {
+                vocab_parts.push(format!("Voice commands: open {}.", vocab.apps.join(", ")));
+            }
+            if !vocab.commands.is_empty() {
+                vocab_parts.push(format!("Commands: {}.", vocab.commands.join(", ")));
+            }
+            if !vocab_parts.is_empty() {
+                parts.push(vocab_parts.join(" "));
+            }
+        }
+        
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" "))
+        }
+    };
+    
+    // Spawn thread to read commands from stdin (for ENTER:<0|1>, INPUT_SOURCE:<system|ble>, and VOCAB: commands)
     let press_enter_clone = press_enter_after_paste.clone();
     let input_source = Arc::new(Mutex::new(String::from("system")));
     let input_source_clone = input_source.clone();
+    let vocabulary_clone = vocabulary.clone();
     std::thread::spawn(move || {
         use std::io::{self, BufRead};
         let stdin = io::stdin();
@@ -675,6 +940,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("MIC: Input source changed to: {}", source_clone);
                         // Note: Actual switching would require restarting the process
                         // This is logged for debugging/monitoring
+                    }
+                } else if let Some(value) = cmd.strip_prefix("VOCAB:") {
+                    // Parse vocabulary JSON: {"apps": [...], "commands": [...]}
+                    if let Ok(vocab_json) = serde_json::from_str::<serde_json::Value>(value.trim()) {
+                        let mut vocab = vocabulary_clone.lock().unwrap();
+                        vocab.apps = vocab_json.get("apps")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                            .unwrap_or_default();
+                        vocab.commands = vocab_json.get("commands")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                            .unwrap_or_default();
+                        eprintln!("MIC: Vocabulary updated: {} apps, {} commands", vocab.apps.len(), vocab.commands.len());
+                    } else {
+                        eprintln!("MIC: Failed to parse VOCAB command");
                     }
                 }
             }
@@ -714,8 +995,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
                 
+                // Get preferred device name from environment variable
+                let preferred_device_name = std::env::var("MEMO_DEVICE_NAME")
+                    .ok()
+                    .filter(|s| !s.is_empty() && s.to_lowercase().starts_with("memo_"));
+                
                 // Connect in trigger-only mode (only Control TX, not Audio Data)
-                if let Err(e) = ble_receiver.connect_trigger_only().await {
+                if let Err(e) = ble_receiver.connect_trigger_only(preferred_device_name.as_deref()).await {
                     eprintln!("Failed to connect to BLE device for trigger (will use keyboard only): {}", e);
                     return;
                 }
@@ -952,6 +1238,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let engine_for_thread = engine_clone.clone();
                         let perf_history = performance_history_clone.clone();
                         let press_enter_clone = press_enter_after_paste.clone();
+                        let vocabulary_for_thread = vocabulary.clone();
                         let sample_count = samples.len();
                         let audio_duration = sample_count as f32 / sample_rate as f32;
                         let start_time = Instant::now();
@@ -960,19 +1247,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("🔄 Transcribing...");
                             let mut eng = engine_for_thread.lock().unwrap();
                             
-                            // Capture application context before transcribing
+                            // Capture application context and vocabulary before transcribing
                             let (app_name, window_title) = app_detection::get_application_context();
-                            let prompt = if !app_name.is_empty() && app_name != "Unknown" {
-                                if !window_title.is_empty() {
-                                    format!("You are transcribing for {}. The current window is: {}.", app_name, window_title)
-                                } else {
-                                    format!("You are transcribing for {}.", app_name)
-                                }
-                            } else {
-                                String::new()
-                            };
+                            let vocab = vocabulary_for_thread.lock().unwrap();
+                            let prompt = build_prompt(app_name, window_title, &vocab);
                             // Always set the prompt (even if empty, to clear previous context)
-                            eng.set_prompt(if prompt.is_empty() { None } else { Some(prompt) });
+                            eng.set_prompt(prompt);
                             
                             let transcribe_start = Instant::now();
                             match eng.transcribe(&samples) {
@@ -1019,10 +1299,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         // Capture application context (already captured before transcription)
                                         let (app_name, window_title) = app_detection::get_application_context();
                                         
+                                        // Process text to strip periods from short phrases
+                                        let processed_text = strip_periods_from_short_phrases(&text);
+                                        
                                         // Output FINAL: JSON for Electron app integration
                                         let json_output = json!({
                                             "rawTranscript": text,
-                                            "processedText": text,
+                                            "processedText": processed_text,
                                             "wasProcessedByLLM": false,
                                             "appContext": {
                                                 "appName": app_name,
@@ -1034,7 +1317,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         // Inject first for fastest response time
                                         let inject_start = Instant::now();
                                         let press_enter = press_enter_clone.load(Ordering::Acquire);
-                                        match inject_text(&text, press_enter) {
+                                        match inject_text(&processed_text, press_enter) {
                                             Ok(_) => {
                                                 let inject_time = inject_start.elapsed();
                                                 let total_time = start_time.elapsed();
@@ -1208,6 +1491,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let engine_for_thread = engine_clone.clone();
                                 let perf_history = performance_history_clone.clone();
                                 let press_enter_clone = press_enter_after_paste.clone();
+                                let vocabulary_for_thread = vocabulary.clone();
                                 let sample_count = samples.len();
                                 let audio_duration = sample_count as f32 / sample_rate as f32;
                                 let start_time = Instant::now();
@@ -1216,19 +1500,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     println!("🔄 Transcribing...");
                                     let mut eng = engine_for_thread.lock().unwrap();
                                     
-                                    // Capture application context before transcribing
+                                    // Capture application context and vocabulary before transcribing
                                     let (app_name, window_title) = app_detection::get_application_context();
-                                    let prompt = if !app_name.is_empty() && app_name != "Unknown" {
-                                        if !window_title.is_empty() {
-                                            format!("You are transcribing for {}. The current window is: {}.", app_name, window_title)
-                                        } else {
-                                            format!("You are transcribing for {}.", app_name)
-                                        }
-                                    } else {
-                                        String::new()
-                                    };
+                                    let vocab = vocabulary_for_thread.lock().unwrap();
+                                    let prompt = build_prompt(app_name, window_title, &vocab);
                                     // Always set the prompt (even if empty, to clear previous context)
-                                    eng.set_prompt(if prompt.is_empty() { None } else { Some(prompt) });
+                                    eng.set_prompt(prompt);
                                     
                                     let transcribe_start = Instant::now();
                                     match eng.transcribe(&samples) {
@@ -1275,10 +1552,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 // Capture application context (already captured before transcription)
                                                 let (app_name, window_title) = app_detection::get_application_context();
                                                 
+                                                // Process text to strip periods from short phrases
+                                                let processed_text = strip_periods_from_short_phrases(&text);
+                                                
                                                 // Output FINAL: JSON for Electron app integration
                                                 let json_output = json!({
                                                     "rawTranscript": text,
-                                                    "processedText": text,
+                                                    "processedText": processed_text,
                                                     "wasProcessedByLLM": false,
                                                     "appContext": {
                                                         "appName": app_name,
@@ -1290,7 +1570,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 // Inject first for fastest response time
                                                 let inject_start = Instant::now();
                                                 let press_enter = press_enter_clone.load(Ordering::Acquire);
-                                                match inject_text(&text, press_enter) {
+                                                match inject_text(&processed_text, press_enter) {
                                                     Ok(_) => {
                                                         let inject_time = inject_start.elapsed();
                                                         let total_time = start_time.elapsed();

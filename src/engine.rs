@@ -2,6 +2,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use crate::Result;
+use num_cpus;
 
 /// Speech-to-text engine optimized for speed and ease of use.
 ///
@@ -98,7 +99,15 @@ impl SttEngine {
         let path = crate::ensure_model(model_path)?;
 
         let path_str = path.to_str().ok_or_else(|| crate::Error("Invalid model path".into()))?;
-        let ctx = WhisperContext::new_with_params(path_str, WhisperContextParameters::default())
+        
+        // Enable GPU/ACCEL auto-detection (will use CPU if no GPU/ACCEL available)
+        // This allows whisper.cpp to automatically detect and use:
+        // - GPU backends (Metal, CUDA, Vulkan, OpenCL)
+        // - ACCEL backends (like Hailo AI Hat on Raspberry Pi)
+        let mut params = WhisperContextParameters::default();
+        params.use_gpu = true; // Enable GPU/ACCEL auto-detection
+        
+        let ctx = WhisperContext::new_with_params(path_str, params)
             .map_err(|e| crate::Error(format!("Failed to load model: {}", e)))?;
         
         let state = ctx.create_state()
@@ -182,7 +191,9 @@ impl SttEngine {
 
         // Create params (reuse configuration pattern)
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_n_threads(2);
+        // Use all available CPU cores for transcription (thread count is set per-transcription)
+        // For Raspberry Pi, 4-6 threads is optimal
+        params.set_n_threads(num_cpus::get().min(8) as i32);
         params.set_translate(false);
         params.set_language(Some("en"));
         params.set_print_progress(false);
