@@ -20,6 +20,45 @@ mod ble;
 #[cfg(feature = "binary")]
 mod opus_decoder;
 
+/// Trailing phrases often triggered by button/PTT click sounds — strip from end of transcript.
+const SIGN_OFF_PHRASES: &[&str] = &[
+    "thank you",
+    "thanks",
+    "thanks for watching",
+    "bye",
+    "goodbye",
+];
+
+/// Strip trailing sign-off phrases (e.g. "Thank you.", "Bye", "Thanks for watching") from transcript.
+/// These are often falsely triggered by the sound of a button/PTT click at end of recording.
+fn strip_trailing_signoffs(text: &str) -> String {
+    let mut out = text.trim().to_string();
+    if out.is_empty() {
+        return out;
+    }
+    loop {
+        let prev_len = out.len();
+        let out_trimmed = out.trim_end_matches(|c: char| c == '.' || c == ',' || c == ' ' || c == '!');
+        let out_lower = out_trimmed.to_lowercase();
+        for phrase in SIGN_OFF_PHRASES {
+            if out_lower.ends_with(phrase) {
+                let n = out_trimmed.chars().count();
+                let p_len = phrase.chars().count();
+                if n >= p_len {
+                    let cut = n - p_len;
+                    out = out_trimmed.chars().take(cut).collect::<String>();
+                    out = out.trim_end_matches(|c: char| c == ' ' || c == '.' || c == ',').to_string();
+                    break;
+                }
+            }
+        }
+        if out.len() == prev_len {
+            break;
+        }
+    }
+    out.trim_end_matches(|c: char| c == ' ' || c == ',').to_string()
+}
+
 /// Strip periods from phrases or sentences that are less than 4 words long
 fn strip_periods_from_short_phrases(text: &str) -> String {
     // Split by common sentence delimiters (period, exclamation, question mark)
@@ -119,6 +158,36 @@ use enigo::{Enigo, KeyboardControllable, Key as EnigoKey};
 // Default trigger key (can be overridden via --hotkey argument)
 const DEFAULT_TRIGGER_KEY: Key = Key::Function;
 
+/// Resolve input device for Radio mode: "default", numeric index, or name match (e.g. "External Microphone").
+/// Matches memo-RF behavior: prefer external mic by name when available.
+fn find_radio_input_device(host: &cpal::Host, spec: &str) -> Option<cpal::Device> {
+    let spec = spec.trim();
+    if spec.is_empty() || spec.eq_ignore_ascii_case("default") {
+        return host.default_input_device();
+    }
+    let devices: Vec<cpal::Device> = match host.input_devices() {
+        Ok(iter) => iter.collect(),
+        Err(_) => return host.default_input_device(),
+    };
+    // Numeric index (e.g. "0" for External Microphone in --list-devices)
+    if let Ok(idx) = spec.parse::<usize>() {
+        if idx < devices.len() {
+            return Some(devices[idx].clone());
+        }
+        return host.default_input_device();
+    }
+    // Name match (substring, case-insensitive)
+    let spec_lower = spec.to_lowercase();
+    for dev in &devices {
+        if let Ok(name) = dev.name() {
+            if name.to_lowercase().contains(&spec_lower) {
+                return Some(dev.clone());
+            }
+        }
+    }
+    host.default_input_device()
+}
+
 // Parse hotkey from string to Key enum
 fn parse_hotkey(key_str: &str) -> Option<Key> {
     match key_str.to_lowercase().as_str() {
@@ -153,6 +222,15 @@ enum KeyEvent {
     StartRecording,
     StopRecording,
     ToggleLock,
+}
+
+/// Compute RMS (root mean square) of i16 samples for VAD.
+fn compute_rms(samples: &[i16]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_squares: i64 = samples.iter().map(|&s| (s as i64).pow(2)).sum();
+    (sum_squares as f32 / samples.len() as f32).sqrt()
 }
 
 // Calculate the rate of increase in realtime factor per second of audio
@@ -233,10 +311,12 @@ end tell"#;
 }
 
 #[cfg(feature = "binary")]
-async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>, no_inject: bool) -> Result<(), Box<dyn std::error::Error>> {
     use ble::BleAudioReceiver;
     use opus_decoder::OpusDecoder;
-    
+
+    let no_inject_flag = Arc::new(AtomicBool::new(no_inject));
+
     println!("Starting BLE audio mode...");
     
     // Initialize Opus decoder (preserved during reconnection)
@@ -245,32 +325,9 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>) -> Result<(), Box<dyn
     // Initialize BLE receiver
     let mut ble_receiver = BleAudioReceiver::new().await?;
     
-    // Get preferred device name from environment variable
-    let preferred_device_name = std::env::var("MEMO_DEVICE_NAME")
-        .ok()
-        .filter(|s| !s.is_empty() && s.to_lowercase().starts_with("memo_"));
-    
-    if let Some(ref name) = preferred_device_name {
-        println!("Using preferred device: {}", name);
-    }
-    
-    // Reconnection state (preserved across reconnection attempts)
-    let mut reconnect_attempts = 0u32;
-    const RECONNECT_DELAY_BASE: u64 = 2; // seconds
-    const RECONNECT_DELAY_MAX: u64 = 30; // seconds
-    
-    // Connect to device (initial connection)
-    println!("Connecting to memo device...");
-    if let Err(e) = ble_receiver.connect(preferred_device_name.as_deref()).await {
-        eprintln!("Failed to connect to BLE device: {}", e);
-        eprintln!("Falling back to system microphone...");
-        // Don't exit - fall back to system mic mode instead
-        // This allows the app to continue working even if BLE is unavailable
-        return Err(e.into());
-    }
-    
-    // Device name is already printed by ble_receiver.connect() via eprintln!
-    println!("Connected! Waiting for button press to start recording...");
+    // DO NOT auto-connect - wait for CONNECT_UID command from Electron
+    // This prevents duplicate connections
+    println!("BLE mode started. Waiting for CONNECT_UID command...");
     
     // State that persists across reconnections (preserved during reconnection)
     let engine_clone = engine.clone();
@@ -325,11 +382,15 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>) -> Result<(), Box<dyn
         }
     };
     
+    // Channel for connection commands from stdin handler
+    let (connect_tx, mut connect_rx) = tokio::sync::mpsc::unbounded_channel::<Option<String>>();
+    
     // Spawn thread to read commands from stdin
     let press_enter_clone = press_enter_after_paste.clone();
     let input_source = Arc::new(Mutex::new(String::from("ble")));
     let input_source_clone = input_source.clone();
     let vocabulary_clone = vocabulary.clone();
+    let connect_tx_for_stdin = connect_tx.clone();
     std::thread::spawn(move || {
         use std::io::{self, BufRead};
         let stdin = io::stdin();
@@ -346,6 +407,17 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>) -> Result<(), Box<dyn
                         *input_source_clone.lock().unwrap() = source;
                         eprintln!("MIC: Input source changed to: {}", source_clone);
                     }
+                } else if let Some(uid) = cmd.strip_prefix("CONNECT_UID:") {
+                    let uid = uid.trim().to_uppercase();
+                    eprintln!("MIC: Connecting to device with UID: {}", uid);
+                    // Format device name: memo_XXXXX
+                    let device_name = format!("memo_{}", uid);
+                    // Send connection request via channel
+                    let _ = connect_tx_for_stdin.send(Some(device_name));
+                } else if cmd.trim() == "DISCONNECT" {
+                    eprintln!("MIC: Disconnecting from BLE device");
+                    // Send disconnect request via channel (None means disconnect)
+                    let _ = connect_tx_for_stdin.send(None);
                 } else if let Some(value) = cmd.strip_prefix("VOCAB:") {
                     // Parse vocabulary JSON: {"apps": [...], "commands": [...]}
                     if let Ok(vocab_json) = serde_json::from_str::<serde_json::Value>(value.trim()) {
@@ -377,44 +449,7 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>) -> Result<(), Box<dyn
     use futures::StreamExt;
     use tokio::time::timeout;
     
-    // Helper function for reconnection logic
-    async fn attempt_reconnect(
-        ble_receiver: &mut BleAudioReceiver,
-        reconnect_attempts: &mut u32,
-        preferred_device_name: Option<&str>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        eprintln!("BLE device disconnected");
-        ble_receiver.disconnect().await.ok();
-        
-        // Calculate exponential backoff delay
-        let attempts_capped = (*reconnect_attempts).min(4); // Cap at 4 for 2^4 = 16 multiplier
-        let delay_seconds = std::cmp::min(
-            RECONNECT_DELAY_BASE * (1u64 << attempts_capped),
-            RECONNECT_DELAY_MAX
-        );
-        
-        *reconnect_attempts += 1;
-        eprintln!("Attempting to reconnect to BLE device in {} seconds (attempt {})...", delay_seconds, reconnect_attempts);
-        
-        // Wait for backoff delay
-        tokio::time::sleep(tokio::time::Duration::from_secs(delay_seconds)).await;
-        
-        // Attempt to reconnect with preferred device name
-        match ble_receiver.connect(preferred_device_name).await {
-            Ok(()) => {
-                // Device name is already printed by ble_receiver.connect() via eprintln!
-                println!("Reconnected! Waiting for button press to start recording...");
-                *reconnect_attempts = 0; // Reset on successful reconnection
-                Ok(())
-            }
-            Err(e) => {
-                eprintln!("Failed to reconnect to BLE device: {}", e);
-                Err(e.into())
-            }
-        }
-    }
-    
-    // Outer loop for reconnection handling
+    // Outer loop: wait for CONNECT_UID command, then connect and process notifications
     loop {
         // Check if input source changed
         {
@@ -425,23 +460,72 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>) -> Result<(), Box<dyn
             }
         }
         
+        // Wait for CONNECT_UID command - DO NOT auto-connect
+        let device_name = loop {
+            match connect_rx.recv().await {
+                Some(Some(name)) => {
+                    // Got connect command
+                    break Some(name);
+                }
+                Some(None) => {
+                    // Got disconnect command
+                    eprintln!("Disconnecting from BLE device");
+                    ble_receiver.disconnect().await.ok();
+                    println!("DISCONNECTED:user_requested");
+                    return Ok(());
+                }
+                None => {
+                    // Channel closed
+                    return Ok(());
+                }
+            }
+        };
+        
+        let device_name = match device_name {
+            Some(name) => name,
+            None => continue,
+        };
+        
+        // Connect to device
+        eprintln!("Connecting to device: {}", device_name);
+        if let Err(e) = ble_receiver.connect(Some(&device_name)).await {
+            eprintln!("Failed to connect to device {}: {}", device_name, e);
+            println!("DISCONNECTED:connection_failed");
+            continue; // Wait for next CONNECT_UID command
+        }
+        
         // Get the notification stream
         let mut notifications = match ble_receiver.notifications().await {
             Ok(stream) => stream,
             Err(e) => {
                 eprintln!("Failed to get notification stream: {}", e);
-                // Attempt reconnection and continue outer loop
-                if attempt_reconnect(&mut ble_receiver, &mut reconnect_attempts, preferred_device_name.as_deref()).await.is_ok() {
-                    continue; // Successfully reconnected, get new stream
-                } else {
-                    continue; // Reconnection failed, retry with longer backoff
-                }
+                println!("DISCONNECTED:notification_stream_failed");
+                // Break to outer loop - wait for new CONNECT_UID command
+                break;
             }
         };
         
         // Inner loop: process notifications with connection monitoring
-        let mut connection_check_interval = tokio::time::interval(tokio::time::Duration::from_secs(3));
-        connection_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Track last notification time to detect real disconnections
+        let mut last_notification_time = std::time::Instant::now();
+        // Central-side light polling (low power): confirm link health while idle via a cheap GATT read.
+        // This avoids false disconnects when the device is connected but idle (no notifications).
+        let poll_interval_secs: u64 = std::env::var("MEMO_BLE_POLL_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(15);
+        let poll_failures_before_disconnect: u32 = std::env::var("MEMO_BLE_POLL_FAILURES_BEFORE_DISCONNECT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        let mut poll_interval = tokio::time::interval(tokio::time::Duration::from_secs(poll_interval_secs));
+        poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut poll_failure_count: u32 = 0;
+
+        // Faster detection during active recording: if we expect notifications but they stop, run a health check.
+        let mut recording_health_check_interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+        recording_health_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut recording_health_failure_count: u32 = 0;
         
         loop {
             // Check if input source changed
@@ -453,13 +537,87 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>) -> Result<(), Box<dyn
                 }
             }
             
-            // Use select! to monitor both notifications and connection health
+            // Use select! to monitor notifications, connection health, and connection commands
             tokio::select! {
-                // Check connection health periodically
-                _ = connection_check_interval.tick() => {
-                    if !ble_receiver.check_connection_health().await {
-                        eprintln!("BLE device disconnected (connection health check failed)");
-                        break; // Break inner loop to attempt reconnection
+                // Low-frequency poll while idle: a small GATT read to confirm the link is alive.
+                _ = poll_interval.tick() => {
+                    if ble_receiver.poll_link().await {
+                        poll_failure_count = 0;
+                    } else {
+                        poll_failure_count = poll_failure_count.saturating_add(1);
+                        eprintln!(
+                            "BLE poll failed ({}/{}) - may be disconnected",
+                            poll_failure_count, poll_failures_before_disconnect
+                        );
+                        if poll_failure_count >= poll_failures_before_disconnect {
+                            eprintln!("BLE poll failures exceeded threshold, assuming connection_lost");
+                            println!("DISCONNECTED:connection_lost");
+                            break;
+                        }
+                    }
+                }
+                // Check for connection/disconnect commands (non-blocking)
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(50)) => {
+                    match connect_rx.try_recv() {
+                        Ok(Some(device_name)) => {
+                            // Check if already connected to the same device
+                            if ble_receiver.is_connected() {
+                                if let Some(current_name) = ble_receiver.device_name() {
+                                    if current_name == &device_name {
+                                        // Already connected to same device, skip reconnect
+                                        continue;
+                                    }
+                                }
+                            }
+                            // Need to reconnect - break inner loop
+                            eprintln!("Reconnecting to device: {}", device_name);
+                            ble_receiver.disconnect().await.ok();
+                            if let Err(e) = ble_receiver.connect(Some(&device_name)).await {
+                                eprintln!("Failed to connect: {}", e);
+                                println!("DISCONNECTED:connection_failed");
+                            }
+                            break; // Break inner loop to get new notification stream
+                        }
+                        Ok(None) => {
+                            // Disconnect
+                            ble_receiver.disconnect().await.ok();
+                            println!("DISCONNECTED:user_requested");
+                            return Ok(());
+                        }
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                            // No command available, continue
+                        }
+                        Err(_) => {
+                            // Channel closed, exit
+                            return Ok(());
+                        }
+                    }
+                }
+                // Fast detection during active recording: if notifications stop for a while, confirm link health.
+                _ = recording_health_check_interval.tick() => {
+                    if is_recording_clone.load(Ordering::Acquire) {
+                        let time_since_last_notification = last_notification_time.elapsed();
+                        if time_since_last_notification.as_secs() >= 8 {
+                            if !ble_receiver.check_connection_health().await {
+                                recording_health_failure_count = recording_health_failure_count.saturating_add(1);
+                                eprintln!(
+                                    "Recording health check failed ({}/2), no notifications for {}s",
+                                    recording_health_failure_count,
+                                    time_since_last_notification.as_secs()
+                                );
+                                if recording_health_failure_count >= 2 {
+                                    eprintln!("Recording health check failures exceeded threshold, assuming connection_lost");
+                                    println!("DISCONNECTED:connection_lost");
+                                    break;
+                                }
+                            } else {
+                                recording_health_failure_count = 0;
+                            }
+                        } else {
+                            recording_health_failure_count = 0;
+                        }
+                    } else {
+                        recording_health_failure_count = 0;
                     }
                 }
                 
@@ -467,6 +625,11 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>) -> Result<(), Box<dyn
                 result = timeout(tokio::time::Duration::from_millis(100), notifications.next()) => {
                     match result {
                         Ok(Some(notification)) => {
+                            // Update last notification time - we're actively receiving data
+                            last_notification_time = std::time::Instant::now();
+                            poll_failure_count = 0;
+                            recording_health_failure_count = 0;
+                            
                             // Process the notification
                             match ble_receiver.process_notification(notification) {
                                 NotificationResult::Control(0x01) => {
@@ -561,6 +724,7 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>) -> Result<(), Box<dyn
                         let engine_for_thread = engine_clone.clone();
                         let perf_history = performance_history.clone();
                         let press_enter_clone = press_enter_after_paste.clone();
+                        let no_inject_clone = no_inject_flag.clone();
                         let vocabulary_for_thread = vocabulary.clone();
                         let sample_count = samples.len();
                         let audio_duration = sample_count as f32 / 16000.0;
@@ -594,7 +758,7 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>) -> Result<(), Box<dyn
                                         println!("📝 (no speech detected)");
                                     } else {
                                         let (app_name, window_title) = app_detection::get_application_context();
-                                        let processed_text = strip_periods_from_short_phrases(&text);
+                                        let processed_text = strip_trailing_signoffs(&strip_periods_from_short_phrases(&text));
                                         let json_output = json!({
                                             "rawTranscript": text,
                                             "processedText": processed_text,
@@ -606,16 +770,22 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>) -> Result<(), Box<dyn
                                         });
                                         println!("FINAL: {}", json_output);
                                         
-                                        let press_enter = press_enter_clone.load(Ordering::Acquire);
-                                        match inject_text(&processed_text, press_enter) {
-                                            Ok(_) => {
-                                                println!("📝 {}", text);
-                                                println!("✅ Injected");
+                                        // Only inject if not in Electron mode
+                                        if !no_inject_clone.load(Ordering::Acquire) {
+                                            let press_enter = press_enter_clone.load(Ordering::Acquire);
+                                            match inject_text(&processed_text, press_enter) {
+                                                Ok(_) => {
+                                                    println!("📝 {}", text);
+                                                    println!("✅ Injected");
+                                                }
+                                                Err(e) => {
+                                                    println!("📝 {}", text);
+                                                    eprintln!("❌ Injection failed: {}", e);
+                                                }
                                             }
-                                            Err(e) => {
-                                                println!("📝 {}", text);
-                                                eprintln!("❌ Injection failed: {}", e);
-                                            }
+                                        } else {
+                                            println!("📝 {}", text);
+                                            println!("⏭️  Injection skipped (Electron mode)");
                                         }
                                     }
                                 }
@@ -696,37 +866,11 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>) -> Result<(), Box<dyn
             }
         }
         
-        // Reconnection logic: stream ended or failed to get stream
+        // Stream ended or failed - disconnect and exit
         eprintln!("BLE device disconnected");
-        
-        // Clean up existing connection
+        println!("DISCONNECTED:connection_lost");
         ble_receiver.disconnect().await.ok();
-        
-        // Calculate exponential backoff delay
-        let attempts_capped = reconnect_attempts.min(4); // Cap at 4 for 2^4 = 16 multiplier
-        let delay_seconds = std::cmp::min(
-            RECONNECT_DELAY_BASE * (1u64 << attempts_capped),
-            RECONNECT_DELAY_MAX
-        );
-        
-        reconnect_attempts += 1;
-        eprintln!("Attempting to reconnect to BLE device in {} seconds (attempt {})...", delay_seconds, reconnect_attempts);
-        
-        // Wait for backoff delay
-        tokio::time::sleep(tokio::time::Duration::from_secs(delay_seconds)).await;
-        
-        // Attempt to reconnect with preferred device name
-        match ble_receiver.connect(preferred_device_name.as_deref()).await {
-            Ok(()) => {
-                // Device name is already printed by ble_receiver.connect() via eprintln!
-                println!("Reconnected! Waiting for button press to start recording...");
-                reconnect_attempts = 0; // Reset on successful reconnection
-            }
-            Err(e) => {
-                eprintln!("Failed to reconnect to BLE device: {}", e);
-                // Continue outer loop to retry with longer backoff
-            }
-        }
+        break;
     }
     
     // Clean up on exit
@@ -738,9 +882,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check INPUT_SOURCE environment variable
     let input_source = std::env::var("INPUT_SOURCE").unwrap_or_else(|_| "system".to_string());
     
-    // Parse command line arguments for hotkey
+    // Parse command line arguments for hotkey and no-inject flag
     let args: Vec<String> = std::env::args().collect();
     let mut trigger_key = DEFAULT_TRIGGER_KEY;
+    let mut no_inject = false;
     
     for i in 0..args.len() {
         if args[i] == "--hotkey" && i + 1 < args.len() {
@@ -750,7 +895,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 eprintln!("Warning: Unknown hotkey '{}', using default (Function)", args[i + 1]);
             }
-            break;
+        } else if args[i] == "--no-inject" {
+            no_inject = true;
+            println!("Auto-injection disabled (Electron mode)");
         }
     }
     
@@ -768,7 +915,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             
             let engine_arc = Arc::new(Mutex::new(engine));
             let rt = tokio::runtime::Runtime::new()?;
-            return rt.block_on(run_ble_audio_mode(engine_arc));
+            return rt.block_on(run_ble_audio_mode(engine_arc, no_inject));
         }
         #[cfg(not(feature = "binary"))]
         {
@@ -795,9 +942,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let performance_history: Arc<Mutex<VecDeque<(f32, f32)>>> = Arc::new(Mutex::new(VecDeque::with_capacity(10)));
     // Press Enter after paste flag
     let press_enter_after_paste = Arc::new(AtomicBool::new(false));
+    // No inject flag (for Electron mode)
+    let no_inject_flag = Arc::new(AtomicBool::new(no_inject));
     
     let host = cpal::default_host();
-    let device = host.default_input_device().ok_or("No input device found")?;
+    let device = if input_source == "radio" {
+        // Radio mode: use External Microphone (headphone jack) like memo-RF, unless overridden
+        let radio_spec = std::env::var("MEMO_RADIO_INPUT_DEVICE")
+            .unwrap_or_else(|_| "External Microphone".to_string());
+        find_radio_input_device(&host, &radio_spec)
+            .ok_or_else(|| format!("No input device found for Radio (spec: {:?}). Set MEMO_RADIO_INPUT_DEVICE=0 or device name.", radio_spec))?
+    } else {
+        host.default_input_device()
+            .ok_or("No input device found")?
+    };
     println!("Using: {}", device.name()?);
     
     let config = device.default_input_config()?;
@@ -814,63 +972,249 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let performance_history_clone = performance_history.clone();
     
     let (tx, rx) = mpsc::channel::<KeyEvent>();
-    
-    // Track key states for detecting combinations
-    let trigger_pressed = Arc::new(AtomicBool::new(false));
-    let control_pressed = Arc::new(AtomicBool::new(false));
-    let lock_toggle_processed = Arc::new(AtomicBool::new(false));
-    
-    let trigger_pressed_clone = trigger_pressed.clone();
-    let control_pressed_clone = control_pressed.clone();
-    let lock_toggle_processed_clone = lock_toggle_processed.clone();
-    let is_locked_listener = is_locked.clone();
-    
-    let trigger_key_for_listener = trigger_key;
-    let tx_keyboard = tx.clone();
-    std::thread::spawn(move || {
-        listen(move |event: Event| {
-            match event.event_type {
-                // Trigger key (configurable via --hotkey)
-                EventType::KeyPress(key) if key == trigger_key_for_listener => {
-                    trigger_pressed_clone.store(true, Ordering::Release);
-                    
-                    // Check if Control is also pressed for lock toggle
-                    if control_pressed_clone.load(Ordering::Acquire) {
-                        if !lock_toggle_processed_clone.swap(true, Ordering::Acquire) {
-                            let _ = tx_keyboard.send(KeyEvent::ToggleLock);
+
+    let use_vad_trigger = input_source == "radio";
+
+    if use_vad_trigger {
+        // Radio mode: VAD trigger. One continuous stream feeds both VAD and recording buffer.
+        let vad_buffer: Arc<Mutex<VecDeque<i16>>> = Arc::new(Mutex::new(VecDeque::with_capacity(48000)));
+        const VAD_BUFFER_MAX_SAMPLES: usize = 48000; // 1 second at 48 kHz
+        let vad_speech_threshold: f32 = std::env::var("VAD_SPEECH_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(800.0);
+        let vad_silence_threshold: f32 = std::env::var("VAD_SILENCE_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(600.0);
+        let vad_speech_start_ms: u64 = std::env::var("VAD_SPEECH_START_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200);
+        let vad_silence_ms: u64 = std::env::var("VAD_SILENCE_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1200);
+        let vad_poll_interval_ms: u64 = 50;
+        let samples_per_poll = (sample_rate as u64 * vad_poll_interval_ms / 1000) as usize;
+
+        let vad_buffer_for_stream = vad_buffer.clone();
+        let vad_buffer_for_poll = vad_buffer.clone();
+        let audio_buffer_vad = audio_buffer_clone.clone();
+        let is_recording_vad = is_recording_clone.clone();
+        let device_vad = device_clone.clone();
+        let config_vad = config_clone.clone();
+        let tx_vad = tx.clone();
+        let last_audio_level_sent_vad = Arc::new(Mutex::new(Instant::now()));
+
+        // Thread 1: continuous stream — push to vad_buffer and to audio_buffer when recording; send AUDIO_LEVELS for waveform
+        std::thread::spawn(move || {
+            let stream_config = config_vad.clone().into();
+            let last_audio_level_sent_clone = last_audio_level_sent_vad.clone();
+            let stream_result = match config_vad.sample_format() {
+                cpal::SampleFormat::I16 => device_vad.build_input_stream(
+                    &stream_config,
+                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                        {
+                            let mut buf = vad_buffer_for_stream.lock().unwrap();
+                            buf.extend(data.iter().copied());
+                            while buf.len() > VAD_BUFFER_MAX_SAMPLES {
+                                buf.pop_front();
+                            }
                         }
-                    } else {
-                        // Normal recording start
-                        let _ = tx_keyboard.send(KeyEvent::StartRecording);
-                    }
-                }
-                EventType::KeyRelease(key) if key == trigger_key_for_listener => {
-                    trigger_pressed_clone.store(false, Ordering::Release);
-                    lock_toggle_processed_clone.store(false, Ordering::Release);
-                    
-                    // Only stop recording if not locked
-                    if !is_locked_listener.load(Ordering::Acquire) {
-                        let _ = tx_keyboard.send(KeyEvent::StopRecording);
-                    }
-                }
-                EventType::KeyPress(Key::ControlLeft) | EventType::KeyPress(Key::ControlRight) => {
-                    control_pressed_clone.store(true, Ordering::Release);
-                    
-                    // Check if Function key is also pressed for lock toggle
-                    if trigger_pressed_clone.load(Ordering::Acquire) {
-                        if !lock_toggle_processed_clone.swap(true, Ordering::Acquire) {
-                            let _ = tx_keyboard.send(KeyEvent::ToggleLock);
+                        if is_recording_vad.load(Ordering::Acquire) {
+                            audio_buffer_vad.lock().unwrap().extend_from_slice(data);
+                            let levels = calculate_audio_levels(data);
+                            let mut last_sent = last_audio_level_sent_clone.lock().unwrap();
+                            if last_sent.elapsed().as_millis() >= 50 {
+                                let json = json!(levels).to_string();
+                                println!("AUDIO_LEVELS:{}", json);
+                                *last_sent = Instant::now();
+                            }
                         }
-                    }
+                    },
+                    |err| eprintln!("VAD stream error: {}", err),
+                    None,
+                ),
+                cpal::SampleFormat::F32 => device_vad.build_input_stream(
+                    &stream_config,
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        let i16_data: Vec<i16> = data
+                            .iter()
+                            .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+                            .collect();
+                        {
+                            let mut buf = vad_buffer_for_stream.lock().unwrap();
+                            buf.extend(i16_data.iter().copied());
+                            while buf.len() > VAD_BUFFER_MAX_SAMPLES {
+                                buf.pop_front();
+                            }
+                        }
+                        if is_recording_vad.load(Ordering::Acquire) {
+                            audio_buffer_vad.lock().unwrap().extend_from_slice(&i16_data);
+                            let levels = calculate_audio_levels(&i16_data);
+                            let mut last_sent = last_audio_level_sent_clone.lock().unwrap();
+                            if last_sent.elapsed().as_millis() >= 50 {
+                                let json = json!(levels).to_string();
+                                println!("AUDIO_LEVELS:{}", json);
+                                *last_sent = Instant::now();
+                            }
+                        }
+                    },
+                    |err| eprintln!("VAD stream error: {}", err),
+                    None,
+                ),
+                cpal::SampleFormat::U16 => device_vad.build_input_stream(
+                    &stream_config,
+                    move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                        let i16_data: Vec<i16> = data
+                            .iter()
+                            .map(|&s| ((s as i32) - 32768) as i16)
+                            .collect();
+                        {
+                            let mut buf = vad_buffer_for_stream.lock().unwrap();
+                            buf.extend(i16_data.iter().copied());
+                            while buf.len() > VAD_BUFFER_MAX_SAMPLES {
+                                buf.pop_front();
+                            }
+                        }
+                        if is_recording_vad.load(Ordering::Acquire) {
+                            audio_buffer_vad.lock().unwrap().extend_from_slice(&i16_data);
+                            let levels = calculate_audio_levels(&i16_data);
+                            let mut last_sent = last_audio_level_sent_clone.lock().unwrap();
+                            if last_sent.elapsed().as_millis() >= 50 {
+                                let json = json!(levels).to_string();
+                                println!("AUDIO_LEVELS:{}", json);
+                                *last_sent = Instant::now();
+                            }
+                        }
+                    },
+                    |err| eprintln!("VAD stream error: {}", err),
+                    None,
+                ),
+                _ => {
+                    eprintln!("VAD: unsupported sample format");
+                    return;
                 }
-                EventType::KeyRelease(Key::ControlLeft) | EventType::KeyRelease(Key::ControlRight) => {
-                    control_pressed_clone.store(false, Ordering::Release);
-                    lock_toggle_processed_clone.store(false, Ordering::Release);
+            };
+            if let Ok(stream) = stream_result {
+                let _ = stream.play();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(3600));
                 }
-                _ => {}
             }
-        }).ok();
-    });
+        });
+
+        // Thread 2: VAD polling — RMS, state machine, send StartRecording/StopRecording
+        std::thread::spawn(move || {
+            let mut state = "idle"; // "idle" | "speech"
+            let mut speech_above_ms: u64 = 0;
+            let mut silence_below_ms: u64 = 0;
+            let poll_duration = std::time::Duration::from_millis(vad_poll_interval_ms);
+
+            loop {
+                std::thread::sleep(poll_duration);
+                let rms = {
+                    let buf = vad_buffer_for_poll.lock().unwrap();
+                    let len = buf.len();
+                    if len >= samples_per_poll {
+                        let start = len - samples_per_poll;
+                        let slice: Vec<i16> = buf.range(start..).copied().collect();
+                        compute_rms(&slice)
+                    } else {
+                        0.0
+                    }
+                };
+
+                match state {
+                    "idle" => {
+                        if rms > vad_speech_threshold {
+                            speech_above_ms += vad_poll_interval_ms;
+                            if speech_above_ms >= vad_speech_start_ms {
+                                state = "speech";
+                                speech_above_ms = 0;
+                                let _ = tx_vad.send(KeyEvent::StartRecording);
+                            }
+                        } else {
+                            speech_above_ms = 0;
+                        }
+                    }
+                    "speech" => {
+                        if rms < vad_silence_threshold {
+                            silence_below_ms += vad_poll_interval_ms;
+                            if silence_below_ms >= vad_silence_ms {
+                                state = "idle";
+                                silence_below_ms = 0;
+                                let _ = tx_vad.send(KeyEvent::StopRecording);
+                            }
+                        } else {
+                            silence_below_ms = 0;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        println!("\nTrigger: VAD (Radio mode)");
+        println!("Speak to start recording, silence to transcribe.\n");
+    } else {
+        // System mode: keyboard hotkey trigger
+        let trigger_pressed = Arc::new(AtomicBool::new(false));
+        let control_pressed = Arc::new(AtomicBool::new(false));
+        let lock_toggle_processed = Arc::new(AtomicBool::new(false));
+
+        let trigger_pressed_clone = trigger_pressed.clone();
+        let control_pressed_clone = control_pressed.clone();
+        let lock_toggle_processed_clone = lock_toggle_processed.clone();
+        let is_locked_listener = is_locked.clone();
+
+        let trigger_key_for_listener = trigger_key;
+        let tx_keyboard = tx.clone();
+        std::thread::spawn(move || {
+            listen(move |event: Event| {
+                match event.event_type {
+                    EventType::KeyPress(key) if key == trigger_key_for_listener => {
+                        trigger_pressed_clone.store(true, Ordering::Release);
+
+                        if control_pressed_clone.load(Ordering::Acquire) {
+                            if !lock_toggle_processed_clone.swap(true, Ordering::Acquire) {
+                                let _ = tx_keyboard.send(KeyEvent::ToggleLock);
+                            }
+                        } else {
+                            let _ = tx_keyboard.send(KeyEvent::StartRecording);
+                        }
+                    }
+                    EventType::KeyRelease(key) if key == trigger_key_for_listener => {
+                        trigger_pressed_clone.store(false, Ordering::Release);
+                        lock_toggle_processed_clone.store(false, Ordering::Release);
+
+                        if !is_locked_listener.load(Ordering::Acquire) {
+                            let _ = tx_keyboard.send(KeyEvent::StopRecording);
+                        }
+                    }
+                    EventType::KeyPress(Key::ControlLeft) | EventType::KeyPress(Key::ControlRight) => {
+                        control_pressed_clone.store(true, Ordering::Release);
+
+                        if trigger_pressed_clone.load(Ordering::Acquire) {
+                            if !lock_toggle_processed_clone.swap(true, Ordering::Acquire) {
+                                let _ = tx_keyboard.send(KeyEvent::ToggleLock);
+                            }
+                        }
+                    }
+                    EventType::KeyRelease(Key::ControlLeft) | EventType::KeyRelease(Key::ControlRight) => {
+                        control_pressed_clone.store(false, Ordering::Release);
+                        lock_toggle_processed_clone.store(false, Ordering::Release);
+                    }
+                    _ => {}
+                }
+            }).ok();
+        });
+
+        println!("\nTrigger: Function key (or BLE device button)");
+        println!("Press and hold to record, release to transcribe.");
+        println!("Lock: Function+Control to toggle lock (keeps recording on)\n");
+    }
     
     // Vocabulary storage for voice commands
     #[derive(Clone)]
@@ -918,7 +1262,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     
-    // Spawn thread to read commands from stdin (for ENTER:<0|1>, INPUT_SOURCE:<system|ble>, and VOCAB: commands)
+    // Spawn thread to read commands from stdin
     let press_enter_clone = press_enter_after_paste.clone();
     let input_source = Arc::new(Mutex::new(String::from("system")));
     let input_source_clone = input_source.clone();
@@ -938,9 +1282,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let source_clone = source.clone();
                         *input_source_clone.lock().unwrap() = source;
                         eprintln!("MIC: Input source changed to: {}", source_clone);
-                        // Note: Actual switching would require restarting the process
-                        // This is logged for debugging/monitoring
+                        // Note: INPUT_SOURCE changes are handled but require process restart in current architecture
+                        // Future: dynamic source switching
                     }
+                } else if cmd.starts_with("SCAN_START:") || cmd.starts_with("SCAN_STOP") ||
+                          cmd.starts_with("CONNECT:") || cmd.starts_with("CONNECT_UID:") ||
+                          cmd.trim() == "DISCONNECT" {
+                    // BLE commands - only work in BLE mode, log them here
+                    eprintln!("MIC: Received BLE command (requires BLE mode): {}", cmd);
                 } else if let Some(value) = cmd.strip_prefix("VOCAB:") {
                     // Parse vocabulary JSON: {"apps": [...], "commands": [...]}
                     if let Ok(vocab_json) = serde_json::from_str::<serde_json::Value>(value.trim()) {
@@ -961,114 +1310,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
-    
-    println!("\nTrigger: Function key (or BLE device button)");
-    println!("Press and hold to record, release to transcribe.");
-    println!("Lock: Function+Control to toggle lock (keeps recording on)\n");
-    
-    // Also connect to BLE device for button press triggers (trigger-only mode)
-    // This allows using BLE device as a remote trigger while audio comes from system mic
-    #[cfg(feature = "binary")]
-    {
-        let tx_ble = tx.clone();
-        let is_locked_ble = is_locked.clone();
-        
-        std::thread::spawn(move || {
-            use ble::BleAudioReceiver;
-            use futures::StreamExt;
-            use tokio::time::timeout;
-            
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    eprintln!("Failed to create tokio runtime for BLE trigger: {}", e);
-                    return;
-                }
-            };
-            
-            rt.block_on(async {
-                let mut ble_receiver = match BleAudioReceiver::new().await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("Failed to initialize BLE receiver for trigger: {}", e);
-                        return;
-                    }
-                };
-                
-                // Get preferred device name from environment variable
-                let preferred_device_name = std::env::var("MEMO_DEVICE_NAME")
-                    .ok()
-                    .filter(|s| !s.is_empty() && s.to_lowercase().starts_with("memo_"));
-                
-                // Connect in trigger-only mode (only Control TX, not Audio Data)
-                if let Err(e) = ble_receiver.connect_trigger_only(preferred_device_name.as_deref()).await {
-                    eprintln!("Failed to connect to BLE device for trigger (will use keyboard only): {}", e);
-                    return;
-                }
-                
-                println!("✅ BLE device connected as trigger (audio from system mic)");
-                
-                // Get notification stream for button presses
-                let mut notifications = match ble_receiver.notifications().await {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        eprintln!("Failed to get BLE notification stream: {}", e);
-                        return;
-                    }
-                };
-                
-                use ble::NotificationResult;
-                
-                loop {
-                    match timeout(tokio::time::Duration::from_millis(100), notifications.next()).await {
-                        Ok(Some(notification)) => {
-                            match ble_receiver.process_notification(notification) {
-                                NotificationResult::Control(0x01) => {
-                                    // RESP_SPEECH_START - Button pressed, start recording
-                                    // Just send the event - let the main loop handle state management
-                                    println!("🎤 Recording... (BLE button pressed)");
-                                    let _ = tx_ble.send(KeyEvent::StartRecording);
-                                }
-                                NotificationResult::Control(0x02) => {
-                                    // RESP_SPEECH_END - Button pressed again, stop recording
-                                    // Only stop if not locked - let the main loop handle state management
-                                    if !is_locked_ble.load(Ordering::Acquire) {
-                                        println!("⏹️  Stopped (BLE button pressed)");
-                                        let _ = tx_ble.send(KeyEvent::StopRecording);
-                                    }
-                                }
-                                _ => {
-                                    // Ignore other notifications
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            // Stream ended
-                            eprintln!("BLE notification stream ended");
-                            break;
-                        }
-                        Err(_) => {
-                            // Timeout - continue loop
-                        }
-                    }
-                }
-            });
-        });
-    }
-    
+
     loop {
         match rx.recv() {
             Ok(KeyEvent::StartRecording) => {
                 if is_recording_clone.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                     println!("🎤 Recording...");
                     audio_buffer_clone.lock().unwrap().clear();
-                    
-                    let buffer = audio_buffer_clone.clone();
-                    let is_recording_for_audio = is_recording_clone.clone();
-                    let last_audio_level_sent = Arc::new(Mutex::new(Instant::now()));
-                    let last_audio_level_sent_clone = last_audio_level_sent.clone();
-                    let stream_config = config_clone.clone().into();
-                    let stream_result = match config_clone.sample_format() {
+
+                    if !use_vad_trigger {
+                        let buffer = audio_buffer_clone.clone();
+                        let is_recording_for_audio = is_recording_clone.clone();
+                        let last_audio_level_sent = Arc::new(Mutex::new(Instant::now()));
+                        let last_audio_level_sent_clone = last_audio_level_sent.clone();
+                        let stream_config = config_clone.clone().into();
+                        let stream_result = match config_clone.sample_format() {
                         cpal::SampleFormat::I16 => {
                             device_clone.build_input_stream(
                                 &stream_config,
@@ -1153,17 +1409,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
                     
-                    if let Ok(stream) = stream_result {
-                        stream.play().ok();
-                        *recording_stream_clone.lock().unwrap() = Some(stream);
-                    } else {
-                        is_recording_clone.store(false, Ordering::SeqCst);
+                        if let Ok(stream) = stream_result {
+                            stream.play().ok();
+                            *recording_stream_clone.lock().unwrap() = Some(stream);
+                        } else {
+                            is_recording_clone.store(false, Ordering::SeqCst);
+                        }
                     }
                 }
             }
             Ok(KeyEvent::StopRecording) => {
                 if is_recording_clone.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                    recording_stream_clone.lock().unwrap().take();
+                    if !use_vad_trigger {
+                        recording_stream_clone.lock().unwrap().take();
+                    }
                     
                     let samples = {
                         let mut buf = audio_buffer_clone.lock().unwrap();
@@ -1238,6 +1497,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let engine_for_thread = engine_clone.clone();
                         let perf_history = performance_history_clone.clone();
                         let press_enter_clone = press_enter_after_paste.clone();
+                        let no_inject_clone = no_inject_flag.clone();
                         let vocabulary_for_thread = vocabulary.clone();
                         let sample_count = samples.len();
                         let audio_duration = sample_count as f32 / sample_rate as f32;
@@ -1300,7 +1560,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let (app_name, window_title) = app_detection::get_application_context();
                                         
                                         // Process text to strip periods from short phrases
-                                        let processed_text = strip_periods_from_short_phrases(&text);
+                                        let processed_text = strip_trailing_signoffs(&strip_periods_from_short_phrases(&text));
                                         
                                         // Output FINAL: JSON for Electron app integration
                                         let json_output = json!({
@@ -1314,41 +1574,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         });
                                         println!("FINAL: {}", json_output);
                                         
-                                        // Inject first for fastest response time
-                                        let inject_start = Instant::now();
-                                        let press_enter = press_enter_clone.load(Ordering::Acquire);
-                                        match inject_text(&processed_text, press_enter) {
-                                            Ok(_) => {
-                                                let inject_time = inject_start.elapsed();
-                                                let total_time = start_time.elapsed();
-                                                println!("📝 {}", text);
-                                                println!("✅ Injected");
-                                                println!("⏱️  Transcription: {:.2}ms ({:.2}x realtime) | Injection: {:.2}ms | Total: {:.2}ms",
-                                                        transcribe_time.as_secs_f32() * 1000.0, 
-                                                        realtime_factor,
-                                                        inject_time.as_secs_f32() * 1000.0,
-                                                        total_time.as_secs_f32() * 1000.0);
-                                                if let Some((rate, pred_30, pred_60)) = rate_info {
-                                                    println!("📈 Rate: +{:.2}x per second | Predicted: {:.1}x @ 30s, {:.1}x @ 60s\n", rate, pred_30, pred_60);
-                                                } else {
-                                                    println!();
+                                        // Only inject if not in Electron mode
+                                        if !no_inject_clone.load(Ordering::Acquire) {
+                                            // Inject first for fastest response time
+                                            let inject_start = Instant::now();
+                                            let press_enter = press_enter_clone.load(Ordering::Acquire);
+                                            match inject_text(&processed_text, press_enter) {
+                                                Ok(_) => {
+                                                    let inject_time = inject_start.elapsed();
+                                                    let total_time = start_time.elapsed();
+                                                    println!("📝 {}", text);
+                                                    println!("✅ Injected");
+                                                    println!("⏱️  Transcription: {:.2}ms ({:.2}x realtime) | Injection: {:.2}ms | Total: {:.2}ms",
+                                                            transcribe_time.as_secs_f32() * 1000.0, 
+                                                            realtime_factor,
+                                                            inject_time.as_secs_f32() * 1000.0,
+                                                            total_time.as_secs_f32() * 1000.0);
+                                                    if let Some((rate, pred_30, pred_60)) = rate_info {
+                                                        println!("📈 Rate: +{:.2}x per second | Predicted: {:.1}x @ 30s, {:.1}x @ 60s\n", rate, pred_30, pred_60);
+                                                    } else {
+                                                        println!();
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    let inject_time = inject_start.elapsed();
+                                                    let total_time = start_time.elapsed();
+                                                    println!("📝 {}", text);
+                                                    eprintln!("❌ Injection failed: {}", e);
+                                                    println!("⏱️  Transcription: {:.2}ms ({:.2}x realtime) | Injection: {:.2}ms | Total: {:.2}ms",
+                                                            transcribe_time.as_secs_f32() * 1000.0, 
+                                                            realtime_factor,
+                                                            inject_time.as_secs_f32() * 1000.0,
+                                                            total_time.as_secs_f32() * 1000.0);
+                                                    if let Some((rate, pred_30, pred_60)) = rate_info {
+                                                        println!("📈 Rate: +{:.2}x per second | Predicted: {:.1}x @ 30s, {:.1}x @ 60s\n", rate, pred_30, pred_60);
+                                                    } else {
+                                                        println!();
+                                                    }
                                                 }
                                             }
-                                            Err(e) => {
-                                                let inject_time = inject_start.elapsed();
-                                                let total_time = start_time.elapsed();
-                                                println!("📝 {}", text);
-                                                eprintln!("❌ Injection failed: {}", e);
-                                                println!("⏱️  Transcription: {:.2}ms ({:.2}x realtime) | Injection: {:.2}ms | Total: {:.2}ms",
-                                                        transcribe_time.as_secs_f32() * 1000.0, 
-                                                        realtime_factor,
-                                                        inject_time.as_secs_f32() * 1000.0,
-                                                        total_time.as_secs_f32() * 1000.0);
-                                                if let Some((rate, pred_30, pred_60)) = rate_info {
-                                                    println!("📈 Rate: +{:.2}x per second | Predicted: {:.1}x @ 30s, {:.1}x @ 60s\n", rate, pred_30, pred_60);
-                                                } else {
-                                                    println!();
-                                                }
+                                        } else {
+                                            let total_time = start_time.elapsed();
+                                            println!("📝 {}", text);
+                                            println!("⏭️  Injection skipped (Electron mode)");
+                                            println!("⏱️  Transcription: {:.2}ms ({:.2}x realtime) | Total: {:.2}ms",
+                                                    transcribe_time.as_secs_f32() * 1000.0, 
+                                                    realtime_factor,
+                                                    total_time.as_secs_f32() * 1000.0);
+                                            if let Some((rate, pred_30, pred_60)) = rate_info {
+                                                println!("📈 Rate: +{:.2}x per second | Predicted: {:.1}x @ 30s, {:.1}x @ 60s\n", rate, pred_30, pred_60);
+                                            } else {
+                                                println!();
                                             }
                                         }
                                     }
@@ -1491,6 +1767,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let engine_for_thread = engine_clone.clone();
                                 let perf_history = performance_history_clone.clone();
                                 let press_enter_clone = press_enter_after_paste.clone();
+                                let no_inject_clone = no_inject_flag.clone();
                                 let vocabulary_for_thread = vocabulary.clone();
                                 let sample_count = samples.len();
                                 let audio_duration = sample_count as f32 / sample_rate as f32;
@@ -1553,7 +1830,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 let (app_name, window_title) = app_detection::get_application_context();
                                                 
                                                 // Process text to strip periods from short phrases
-                                                let processed_text = strip_periods_from_short_phrases(&text);
+                                                let processed_text = strip_trailing_signoffs(&strip_periods_from_short_phrases(&text));
                                                 
                                                 // Output FINAL: JSON for Electron app integration
                                                 let json_output = json!({
@@ -1567,41 +1844,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 });
                                                 println!("FINAL: {}", json_output);
                                                 
-                                                // Inject first for fastest response time
-                                                let inject_start = Instant::now();
-                                                let press_enter = press_enter_clone.load(Ordering::Acquire);
-                                                match inject_text(&processed_text, press_enter) {
-                                                    Ok(_) => {
-                                                        let inject_time = inject_start.elapsed();
-                                                        let total_time = start_time.elapsed();
-                                                        println!("📝 {}", text);
-                                                        println!("✅ Injected");
-                                                        println!("⏱️  Transcription: {:.2}ms ({:.2}x realtime) | Injection: {:.2}ms | Total: {:.2}ms",
-                                                                transcribe_time.as_secs_f32() * 1000.0, 
-                                                                realtime_factor,
-                                                                inject_time.as_secs_f32() * 1000.0,
-                                                                total_time.as_secs_f32() * 1000.0);
-                                                        if let Some((rate, pred_30, pred_60)) = rate_info {
-                                                            println!("📈 Rate: +{:.2}x per second | Predicted: {:.1}x @ 30s, {:.1}x @ 60s\n", rate, pred_30, pred_60);
-                                                        } else {
-                                                            println!();
+                                                // Only inject if not in Electron mode
+                                                if !no_inject_clone.load(Ordering::Acquire) {
+                                                    // Inject first for fastest response time
+                                                    let inject_start = Instant::now();
+                                                    let press_enter = press_enter_clone.load(Ordering::Acquire);
+                                                    match inject_text(&processed_text, press_enter) {
+                                                        Ok(_) => {
+                                                            let inject_time = inject_start.elapsed();
+                                                            let total_time = start_time.elapsed();
+                                                            println!("📝 {}", text);
+                                                            println!("✅ Injected");
+                                                            println!("⏱️  Transcription: {:.2}ms ({:.2}x realtime) | Injection: {:.2}ms | Total: {:.2}ms",
+                                                                    transcribe_time.as_secs_f32() * 1000.0, 
+                                                                    realtime_factor,
+                                                                    inject_time.as_secs_f32() * 1000.0,
+                                                                    total_time.as_secs_f32() * 1000.0);
+                                                            if let Some((rate, pred_30, pred_60)) = rate_info {
+                                                                println!("📈 Rate: +{:.2}x per second | Predicted: {:.1}x @ 30s, {:.1}x @ 60s\n", rate, pred_30, pred_60);
+                                                            } else {
+                                                                println!();
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            let inject_time = inject_start.elapsed();
+                                                            let total_time = start_time.elapsed();
+                                                            println!("📝 {}", text);
+                                                            eprintln!("❌ Injection failed: {}", e);
+                                                            println!("⏱️  Transcription: {:.2}ms ({:.2}x realtime) | Injection: {:.2}ms | Total: {:.2}ms",
+                                                                    transcribe_time.as_secs_f32() * 1000.0, 
+                                                                    realtime_factor,
+                                                                    inject_time.as_secs_f32() * 1000.0,
+                                                                    total_time.as_secs_f32() * 1000.0);
+                                                            if let Some((rate, pred_30, pred_60)) = rate_info {
+                                                                println!("📈 Rate: +{:.2}x per second | Predicted: {:.1}x @ 30s, {:.1}x @ 60s\n", rate, pred_30, pred_60);
+                                                            } else {
+                                                                println!();
+                                                            }
                                                         }
                                                     }
-                                                    Err(e) => {
-                                                        let inject_time = inject_start.elapsed();
-                                                        let total_time = start_time.elapsed();
-                                                        println!("📝 {}", text);
-                                                        eprintln!("❌ Injection failed: {}", e);
-                                                        println!("⏱️  Transcription: {:.2}ms ({:.2}x realtime) | Injection: {:.2}ms | Total: {:.2}ms",
-                                                                transcribe_time.as_secs_f32() * 1000.0, 
-                                                                realtime_factor,
-                                                                inject_time.as_secs_f32() * 1000.0,
-                                                                total_time.as_secs_f32() * 1000.0);
-                                                        if let Some((rate, pred_30, pred_60)) = rate_info {
-                                                            println!("📈 Rate: +{:.2}x per second | Predicted: {:.1}x @ 30s, {:.1}x @ 60s\n", rate, pred_30, pred_60);
-                                                        } else {
-                                                            println!();
-                                                        }
+                                                } else {
+                                                    let total_time = start_time.elapsed();
+                                                    println!("📝 {}", text);
+                                                    println!("⏭️  Injection skipped (Electron mode)");
+                                                    println!("⏱️  Transcription: {:.2}ms ({:.2}x realtime) | Total: {:.2}ms",
+                                                            transcribe_time.as_secs_f32() * 1000.0, 
+                                                            realtime_factor,
+                                                            total_time.as_secs_f32() * 1000.0);
+                                                    if let Some((rate, pred_30, pred_60)) = rate_info {
+                                                        println!("📈 Rate: +{:.2}x per second | Predicted: {:.1}x @ 30s, {:.1}x @ 60s\n", rate, pred_30, pred_60);
+                                                    } else {
+                                                        println!();
                                                     }
                                                 }
                                             }
