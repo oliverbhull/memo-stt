@@ -9,11 +9,51 @@ use rdev::{listen, Event, EventType, Key};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::sync::mpsc;
 use std::time::Instant;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use serde_json::json;
 #[cfg(feature = "binary")]
 use log::debug;
 mod app_detection;
+
+/// When stdout is a pipe (Electron), Rust uses a block buffer — lines can sit until the buffer fills.
+/// Flush so the UI overlay sees recording / stopped state immediately.
+macro_rules! println_ui_flush {
+    ($($arg:tt)*) => {{
+        println!($($arg)*);
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }};
+}
+
+/// Minimum interval between `AUDIO_LEVELS:` lines (ms). `0` = no throttle (emit every callback / decoded frame).
+/// Set `MEMO_AUDIO_LEVELS_INTERVAL_MS` (e.g. `33` for ~30 fps) if stdout/IPC cannot keep up.
+static MEMO_AUDIO_LEVELS_INTERVAL_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+fn memo_audio_levels_interval_ms() -> u64 {
+    *MEMO_AUDIO_LEVELS_INTERVAL_MS.get_or_init(|| {
+        std::env::var("MEMO_AUDIO_LEVELS_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+fn should_emit_audio_levels_throttled(last_sent: &mut Option<Instant>, interval_ms: u64) -> bool {
+    if interval_ms == 0 {
+        return true;
+    }
+    let now = Instant::now();
+    match last_sent {
+        None => {
+            *last_sent = Some(now);
+            true
+        }
+        Some(prev) if now.duration_since(*prev).as_millis() >= u128::from(interval_ms) => {
+            *last_sent = Some(now);
+            true
+        }
+        Some(_) => false,
+    }
+}
 
 #[cfg(feature = "binary")]
 mod ble;
@@ -59,44 +99,63 @@ fn strip_trailing_signoffs(text: &str) -> String {
     out.trim_end_matches(|c: char| c == ' ' || c == ',').to_string()
 }
 
-/// Strip periods from phrases or sentences that are less than 4 words long
+/// Strip trailing period from short final phrase (<4 words).
+/// Internal sentence-ending punctuation is always preserved to maintain readability.
 fn strip_periods_from_short_phrases(text: &str) -> String {
-    // Split by common sentence delimiters (period, exclamation, question mark)
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let last_char = trimmed.chars().last().unwrap();
+    if last_char != '.' && last_char != '!' && last_char != '?' {
+        return trimmed.to_string();
+    }
+
+    let without_final = &trimmed[..trimmed.len() - last_char.len_utf8()];
+    let last_delim = without_final.rfind(|c: char| c == '.' || c == '!' || c == '?');
+    let last_sentence = match last_delim {
+        Some(pos) => &without_final[pos + 1..],
+        None => without_final,
+    };
+    let word_count = last_sentence.trim().split_whitespace().count();
+    if word_count < 4 {
+        return without_final.to_string();
+    }
+
+    trimmed.to_string()
+}
+
+/// Strip leading dash and following space(s) from transcript (e.g. Whisper bullet-style "- Can you...").
+fn strip_leading_dash_space(text: &str) -> String {
+    let s = text.trim();
+    if s.starts_with('-') {
+        s[1..].trim_start().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Join streaming transcription segments with proper sentence boundaries.
+/// Ensures each non-final segment ends with punctuation so sentences don't run together.
+fn join_segments(parts: &[String]) -> String {
+    if parts.is_empty() { return String::new(); }
+    if parts.len() == 1 { return parts[0].clone(); }
+
     let mut result = String::new();
-    let mut current_phrase = String::new();
-    
-    for ch in text.chars() {
-        if ch == '.' || ch == '!' || ch == '?' {
-            // End of a phrase/sentence
-            let phrase = current_phrase.trim();
-            if !phrase.is_empty() {
-                // Count words in the phrase
-                let word_count = phrase.split_whitespace().count();
-                
-                if word_count < 4 {
-                    // Strip the period for short phrases
-                    result.push_str(&phrase);
-                    // Don't add the period
-                } else {
-                    // Keep the period for longer phrases
-                    result.push_str(&phrase);
-                    result.push(ch);
-                }
-                result.push(' ');
+    for (i, part) in parts.iter().enumerate() {
+        let trimmed = part.trim();
+        if trimmed.is_empty() { continue; }
+        if !result.is_empty() { result.push(' '); }
+        result.push_str(trimmed);
+        if i < parts.len() - 1 {
+            let last = trimmed.chars().last().unwrap_or(' ');
+            if last != '.' && last != '!' && last != '?' && last != ',' {
+                result.push('.');
             }
-            current_phrase.clear();
-        } else {
-            current_phrase.push(ch);
         }
     }
-    
-    // Handle any remaining text (no trailing punctuation)
-    if !current_phrase.trim().is_empty() {
-        let phrase = current_phrase.trim();
-        result.push_str(&phrase);
-    }
-    
-    result.trim().to_string()
+    result
 }
 
 // Calculate audio levels for waveform visualization
@@ -126,31 +185,31 @@ fn calculate_audio_levels(samples: &[i16]) -> Vec<f32> {
         .collect()
 }
 
-// Calculate audio levels for BLE audio with reduced sensitivity
-// Uses a higher normalization threshold to make the waveform less reactive
+// Calculate audio levels for BLE waveform overlay (0.0–1.0 per bar).
+// Calibrated for firmware 20ms frames / current PDM gain; tune via env if needed.
 fn calculate_audio_levels_ble(samples: &[i16]) -> Vec<f32> {
     if samples.is_empty() {
         return vec![0.0; 7];
     }
-    
-    // Calculate RMS (Root Mean Square) for audio level
+
     let sum_squares: i64 = samples.iter().map(|&s| (s as i64).pow(2)).sum();
     let rms = (sum_squares as f32 / samples.len() as f32).sqrt();
-    
-    // Normalize to 0-1 range with higher threshold for reduced sensitivity
-    // Higher threshold = less sensitive (requires louder audio to reach full scale)
-    const NORMALIZATION_THRESHOLD: f32 = 20000.0;  // Increased from 15000.0
-    const GAIN_BOOST: f32 = 1.5;  // Reduced from 2.0
-    let normalized = ((rms / NORMALIZATION_THRESHOLD) * GAIN_BOOST).min(1.0);
-    
-    // Apply exponential scaling for better visual response
+
+    // Normalize to 0–1 for overlay. Threshold/gain tuned for BLE decoded PCM (20ms bundles).
+    // Optional env override: MEMO_BLE_WAVEFORM_THRESHOLD, MEMO_BLE_WAVEFORM_GAIN
+    let threshold = std::env::var("MEMO_BLE_WAVEFORM_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(20000.0);
+    let gain = std::env::var("MEMO_BLE_WAVEFORM_GAIN")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(1.5);
+    let normalized = ((rms / threshold) * gain).min(1.0);
+
     let scaled = normalized.powf(0.4);
-    
-    // Create 7 bands with symmetric weighting (center bars higher, edges taper down)
     let weights = vec![0.6, 0.8, 0.95, 1.0, 0.95, 0.8, 0.6];
-    weights.into_iter()
-        .map(|w| (scaled * w).min(1.0))
-        .collect()
+    weights.into_iter().map(|w| (scaled * w).min(1.0)).collect()
 }
 #[cfg(not(target_os = "macos"))]
 use enigo::{Enigo, KeyboardControllable, Key as EnigoKey};
@@ -158,9 +217,8 @@ use enigo::{Enigo, KeyboardControllable, Key as EnigoKey};
 // Default trigger key (can be overridden via --hotkey argument)
 const DEFAULT_TRIGGER_KEY: Key = Key::Function;
 
-/// Resolve input device for Radio mode: "default", numeric index, or name match (e.g. "External Microphone").
-/// Matches memo-RF behavior: prefer external mic by name when available.
-fn find_radio_input_device(host: &cpal::Host, spec: &str) -> Option<cpal::Device> {
+/// Resolve input device: "default", numeric index, or substring name match (e.g. "AirPods", "External Microphone").
+fn find_input_device_by_spec(host: &cpal::Host, spec: &str) -> Option<cpal::Device> {
     let spec = spec.trim();
     if spec.is_empty() || spec.eq_ignore_ascii_case("default") {
         return host.default_input_device();
@@ -169,14 +227,12 @@ fn find_radio_input_device(host: &cpal::Host, spec: &str) -> Option<cpal::Device
         Ok(iter) => iter.collect(),
         Err(_) => return host.default_input_device(),
     };
-    // Numeric index (e.g. "0" for External Microphone in --list-devices)
     if let Ok(idx) = spec.parse::<usize>() {
         if idx < devices.len() {
             return Some(devices[idx].clone());
         }
         return host.default_input_device();
     }
-    // Name match (substring, case-insensitive)
     let spec_lower = spec.to_lowercase();
     for dev in &devices {
         if let Ok(name) = dev.name() {
@@ -186,6 +242,131 @@ fn find_radio_input_device(host: &cpal::Host, spec: &str) -> Option<cpal::Device
         }
     }
     host.default_input_device()
+}
+
+/// Prefer mono input and the highest sample rate up to 48 kHz (better quality when the device allows it).
+fn best_input_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig, Box<dyn std::error::Error>> {
+    use cpal::SampleRate;
+    let default = device.default_input_config()?;
+    let Ok(mut configs) = device.supported_input_configs() else {
+        return Ok(default);
+    };
+    let candidates: Vec<cpal::SupportedStreamConfigRange> = configs.collect();
+    if candidates.is_empty() {
+        return Ok(default);
+    }
+    let pick_mono = candidates
+        .iter()
+        .filter(|c| c.channels() == 1)
+        .max_by_key(|c| c.max_sample_rate().0);
+    let pick_any = candidates
+        .iter()
+        .max_by_key(|c| c.max_sample_rate().0);
+    let range = pick_mono.or(pick_any).unwrap_or(&candidates[0]);
+    let max_sr = range.max_sample_rate().0;
+    let min_sr = range.min_sample_rate().0;
+    let target = max_sr.min(48_000).max(min_sr);
+    Ok(range.with_sample_rate(SampleRate(target)))
+}
+
+fn extend_buffer_mono_i16(buf: &mut Vec<i16>, data: &[i16], channels: usize) {
+    match channels {
+        1 => buf.extend_from_slice(data),
+        n if n > 1 => {
+            for frame in data.chunks_exact(n) {
+                let sum: i32 = frame.iter().map(|&s| s as i32).sum();
+                buf.push((sum / n as i32) as i16);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extend_buffer_mono_f32(buf: &mut Vec<i16>, data: &[f32], channels: usize) {
+    match channels {
+        1 => {
+            for &s in data {
+                buf.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
+            }
+        }
+        n if n > 1 => {
+            for frame in data.chunks_exact(n) {
+                let mut acc = 0.0f32;
+                for &s in frame {
+                    acc += s.clamp(-1.0, 1.0);
+                }
+                buf.push(((acc / n as f32) * 32767.0) as i16);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extend_buffer_mono_u16(buf: &mut Vec<i16>, data: &[u16], channels: usize) {
+    match channels {
+        1 => {
+            for &s in data {
+                buf.push(((s as i32) - 32768) as i16);
+            }
+        }
+        n if n > 1 => {
+            for frame in data.chunks_exact(n) {
+                let sum: i32 = frame.iter().map(|&s| (s as i32) - 32768).sum();
+                buf.push((sum / n as i32) as i16);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn audio_levels_interleaved_i16(data: &[i16], ch: usize) -> Vec<f32> {
+    if ch <= 1 {
+        return calculate_audio_levels(data);
+    }
+    let mono: Vec<i16> = data
+        .chunks_exact(ch)
+        .map(|frame| {
+            let s: i32 = frame.iter().map(|&x| x as i32).sum();
+            (s / ch as i32) as i16
+        })
+        .collect();
+    calculate_audio_levels(&mono)
+}
+
+fn audio_levels_interleaved_f32(data: &[f32], ch: usize) -> Vec<f32> {
+    if ch <= 1 {
+        let mono: Vec<i16> = data
+            .iter()
+            .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+            .collect();
+        return calculate_audio_levels(&mono);
+    }
+    let mono: Vec<i16> = data
+        .chunks_exact(ch)
+        .map(|frame| {
+            let acc: f32 = frame.iter().map(|&s| s.clamp(-1.0, 1.0)).sum::<f32>() / ch as f32;
+            (acc * 32767.0) as i16
+        })
+        .collect();
+    calculate_audio_levels(&mono)
+}
+
+fn audio_levels_interleaved_u16(data: &[u16], ch: usize) -> Vec<f32> {
+    if ch <= 1 {
+        let mono: Vec<i16> = data
+            .iter()
+            .map(|&s| ((s as i32) - 32768) as i16)
+            .collect();
+        return calculate_audio_levels(&mono);
+    }
+    let mono: Vec<i16> = data
+        .chunks_exact(ch)
+        .map(|frame| {
+            let s: i32 = frame.iter().map(|&x| (x as i32) - 32768).sum();
+            (s / ch as i32) as i16
+        })
+        .collect();
+    calculate_audio_levels(&mono)
 }
 
 // Parse hotkey from string to Key enum
@@ -339,20 +520,21 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>, no_inject: bool) -> R
     // Vocabulary storage for voice commands
     #[derive(Clone)]
     struct Vocabulary {
-        apps: Vec<String>,
-        commands: Vec<String>,
+        app_names: Vec<String>,
+        app_commands: HashMap<String, Vec<String>>,
+        global_commands: Vec<String>,
     }
     
     let vocabulary = Arc::new(Mutex::new(Vocabulary {
-        apps: Vec::new(),
-        commands: Vec::new(),
+        app_names: Vec::new(),
+        app_commands: HashMap::new(),
+        global_commands: Vec::new(),
     }));
     
-    // Helper function to build combined prompt with app context and vocabulary
+    // Build prompt with only the active app's commands (+ global) to avoid hallucination
     let build_prompt = |app_name: String, window_title: String, vocab: &Vocabulary| -> Option<String> {
         let mut parts = Vec::new();
         
-        // Add app context
         if !app_name.is_empty() && app_name != "Unknown" {
             if !window_title.is_empty() {
                 parts.push(format!("You are transcribing for {}. The current window is: {}.", app_name, window_title));
@@ -361,18 +543,19 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>, no_inject: bool) -> R
             }
         }
         
-        // Add vocabulary for voice commands
-        if !vocab.apps.is_empty() || !vocab.commands.is_empty() {
-            let mut vocab_parts = Vec::new();
-            if !vocab.apps.is_empty() {
-                vocab_parts.push(format!("Voice commands: open {}.", vocab.apps.join(", ")));
+        if !vocab.app_names.is_empty() {
+            parts.push(format!("Voice commands: open {}.", vocab.app_names.join(", ")));
+        }
+        
+        let mut active_cmds: Vec<&str> = vocab.global_commands.iter().map(|s| s.as_str()).collect();
+        if !app_name.is_empty() {
+            let key = app_name.to_lowercase();
+            if let Some(cmds) = vocab.app_commands.get(&key) {
+                active_cmds.extend(cmds.iter().map(|s| s.as_str()));
             }
-            if !vocab.commands.is_empty() {
-                vocab_parts.push(format!("Commands: {}.", vocab.commands.join(", ")));
-            }
-            if !vocab_parts.is_empty() {
-                parts.push(vocab_parts.join(" "));
-            }
+        }
+        if !active_cmds.is_empty() {
+            parts.push(format!("Commands: {}.", active_cmds.join(", ")));
         }
         
         if parts.is_empty() {
@@ -419,18 +602,27 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>, no_inject: bool) -> R
                     // Send disconnect request via channel (None means disconnect)
                     let _ = connect_tx_for_stdin.send(None);
                 } else if let Some(value) = cmd.strip_prefix("VOCAB:") {
-                    // Parse vocabulary JSON: {"apps": [...], "commands": [...]}
                     if let Ok(vocab_json) = serde_json::from_str::<serde_json::Value>(value.trim()) {
                         let mut vocab = vocabulary_clone.lock().unwrap();
-                        vocab.apps = vocab_json.get("apps")
+                        vocab.app_names = vocab_json.get("appNames")
                             .and_then(|v| v.as_array())
                             .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                             .unwrap_or_default();
-                        vocab.commands = vocab_json.get("commands")
+                        vocab.global_commands = vocab_json.get("globalCommands")
                             .and_then(|v| v.as_array())
                             .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                             .unwrap_or_default();
-                        eprintln!("MIC: Vocabulary updated: {} apps, {} commands", vocab.apps.len(), vocab.commands.len());
+                        vocab.app_commands.clear();
+                        if let Some(obj) = vocab_json.get("appCommands").and_then(|v| v.as_object()) {
+                            for (key, val) in obj {
+                                if let Some(arr) = val.as_array() {
+                                    let cmds: Vec<String> = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                                    vocab.app_commands.insert(key.clone(), cmds);
+                                }
+                            }
+                        }
+                        eprintln!("MIC: Vocabulary updated: {} app names, {} apps with commands, {} global commands",
+                            vocab.app_names.len(), vocab.app_commands.len(), vocab.global_commands.len());
                     } else {
                         eprintln!("MIC: Failed to parse VOCAB command");
                     }
@@ -442,8 +634,6 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>, no_inject: bool) -> R
     // Main loop: listen for button presses and buffer audio during recording
     let is_recording_clone = is_recording.clone();
     let audio_buffer_clone = audio_buffer.clone();
-    let last_audio_level_sent = Arc::new(Mutex::new(Instant::now()));
-    let last_audio_level_sent_clone = last_audio_level_sent.clone();
     
     use ble::NotificationResult;
     use futures::StreamExt;
@@ -526,7 +716,11 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>, no_inject: bool) -> R
         let mut recording_health_check_interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
         recording_health_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut recording_health_failure_count: u32 = 0;
-        
+
+        // Track expected bundle index for packet-loss detection; use FEC when previous packet was lost.
+        let mut expected_bundle_index: Option<u8> = None;
+        let last_audio_level_sent_ble = Arc::new(Mutex::new(None::<Instant>));
+
         loop {
             // Check if input source changed
             {
@@ -637,7 +831,7 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>, no_inject: bool) -> R
                                     if !is_recording_clone.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                                         continue; // Already recording
                                     }
-                                    println!("🎤 Recording... (button pressed)");
+                                    println_ui_flush!("🎤 Recording... (button pressed)");
                                     audio_buffer_clone.lock().unwrap().clear();
                                 }
                                 NotificationResult::Control(0x02) => {
@@ -653,7 +847,7 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>, no_inject: bool) -> R
                                     };
                                     
                                     if !samples.is_empty() {
-                                        println!("⏹️  Stopped ({} samples, {:.2}s)", samples.len(), samples.len() as f32 / 16000.0);
+                                        println_ui_flush!("⏹️  Stopped ({} samples, {:.2}s)", samples.len(), samples.len() as f32 / 16000.0);
                                         
                                         // Encode audio to OPUS for saving
                                         let samples_for_encoding = samples.clone();
@@ -758,7 +952,7 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>, no_inject: bool) -> R
                                         println!("📝 (no speech detected)");
                                     } else {
                                         let (app_name, window_title) = app_detection::get_application_context();
-                                        let processed_text = strip_trailing_signoffs(&strip_periods_from_short_phrases(&text));
+                                        let processed_text = strip_leading_dash_space(&strip_trailing_signoffs(&strip_periods_from_short_phrases(&text)));
                                         let json_output = json!({
                                             "rawTranscript": text,
                                             "processedText": processed_text,
@@ -795,8 +989,12 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>, no_inject: bool) -> R
                             }
                         });
                                     } else {
-                                        println!("⏹️  Stopped (no audio captured)");
+                                        println_ui_flush!("⏹️  Stopped (no audio captured)");
                                     }
+                                }
+                                NotificationResult::Control(0x03) => {
+                                    // RESP_PRESS_ENTER — second button tap shortly after stop (Memo Desktop)
+                                    println_ui_flush!("BLE_PRESS_ENTER");
                                 }
                                 NotificationResult::Audio(audio_data) => {
                                     // Only process audio if we're recording
@@ -817,25 +1015,49 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>, no_inject: bool) -> R
                                     // Extract bundle data (skip 1-byte bundle_index header)
                                     let bundle_index = audio_data[0];
                                     let bundle_data = &audio_data[1..];
-                                    
+
                                     debug!("Received audio packet: bundle_index={}, size={} bytes", bundle_index, audio_data.len());
-                                    
-                                    // Decode Opus bundle to PCM
-                                    match decoder.decode_bundle(bundle_data) {
+
+                                    let decode_result = match expected_bundle_index {
+                                        None => {
+                                            expected_bundle_index = Some(bundle_index.wrapping_add(1));
+                                            decoder.decode_bundle(bundle_data)
+                                        }
+                                        Some(expected) => {
+                                            if bundle_index == expected {
+                                                expected_bundle_index = Some(bundle_index.wrapping_add(1));
+                                                decoder.decode_bundle(bundle_data)
+                                            } else {
+                                                // Gap: one or more packets lost
+                                                let lost = bundle_index.wrapping_sub(expected);
+                                                for _ in 0..lost.saturating_sub(1) {
+                                                    if let Ok(plc) = decoder.decode_plc() {
+                                                        audio_buffer_clone.lock().unwrap().extend_from_slice(&plc);
+                                                    }
+                                                }
+                                                expected_bundle_index = Some(bundle_index.wrapping_add(1));
+                                                decoder.decode_bundle_with_fec(bundle_data)
+                                            }
+                                        }
+                                    };
+
+                                    match decode_result {
                                         Ok(pcm_samples) => {
                                             if !pcm_samples.is_empty() {
                                                 // Add to buffer while recording
                                                 audio_buffer_clone.lock().unwrap().extend_from_slice(&pcm_samples);
-                                                
+
                                                 // Calculate and send audio levels for waveform visualization (BLE with reduced sensitivity)
                                                 if is_recording_clone.load(Ordering::Acquire) {
                                                     let levels = calculate_audio_levels_ble(&pcm_samples);
-                                                    let mut last_sent = last_audio_level_sent_clone.lock().unwrap();
-                                                    // Throttle to ~20fps (50ms intervals)
-                                                    if last_sent.elapsed().as_millis() >= 50 {
+                                                    let interval_ms = memo_audio_levels_interval_ms();
+                                                    let mut last_sent = last_audio_level_sent_ble.lock().unwrap();
+                                                    if should_emit_audio_levels_throttled(
+                                                        &mut *last_sent,
+                                                        interval_ms,
+                                                    ) {
                                                         let json = json!(levels).to_string();
-                                                        println!("AUDIO_LEVELS:{}", json);
-                                                        *last_sent = Instant::now();
+                                                        println_ui_flush!("AUDIO_LEVELS:{}", json);
                                                     }
                                                 }
                                             }
@@ -845,8 +1067,8 @@ async fn run_ble_audio_mode(engine: Arc<Mutex<SttEngine>>, no_inject: bool) -> R
                                         }
                                     }
                                 }
-                                NotificationResult::Control(_) => {
-                                    // Other control events, ignore (already handled above)
+                                NotificationResult::Control(code) => {
+                                    eprintln!("BLE unknown control notification: 0x{:02X}", code);
                                 }
                                 NotificationResult::None => {
                                     // Not a notification we care about
@@ -924,51 +1146,76 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     
-    // Continue with system mic mode (existing code)
-    // System mic typically uses 48kHz, so initialize engine with 48kHz
-    println!("Loading Whisper model (48kHz for system mic)...");
-    let engine = SttEngine::new_default(48000)?;
-    
+    // Resolve input device and stream config BEFORE creating the STT engine so input_sample_rate matches
+    // the actual hardware (critical for Bluetooth / AirPods HFP at 8–16 kHz vs built-in at 48 kHz).
+    let host = cpal::default_host();
+    let device = if input_source == "radio" {
+        let radio_spec = std::env::var("MEMO_RADIO_INPUT_DEVICE")
+            .unwrap_or_else(|_| "External Microphone".to_string());
+        find_input_device_by_spec(&host, &radio_spec)
+            .ok_or_else(|| format!("No input device found for Radio (spec: {:?}). Set MEMO_RADIO_INPUT_DEVICE=0 or device name.", radio_spec))?
+    } else {
+        let spec = std::env::var("MEMO_SYSTEM_INPUT_DEVICE").unwrap_or_default();
+        if !spec.trim().is_empty() {
+            find_input_device_by_spec(&host, spec.trim())
+                .or_else(|| host.default_input_device())
+                .ok_or("No input device found")?
+        } else {
+            host.default_input_device().ok_or("No input device found")?
+        }
+    };
+
+    let config = best_input_config(&device)?;
+    let sample_rate = config.sample_rate().0;
+    let stream_channels = config.channels() as usize;
+    let dev_name = device.name().unwrap_or_else(|_| "?".to_string());
+    println!("MIC_INFO:{}\t{}", dev_name.replace('\t', " "), sample_rate);
+    println!("Using: {}", dev_name);
+    println!("Sample rate: {} Hz, channels: {}, format: {:?}", sample_rate, stream_channels, config.sample_format());
+
+    println!("Loading Whisper model ({} Hz input)...", sample_rate);
+    let engine = SttEngine::new_default(sample_rate)?;
+
     println!("Warming up GPU...");
     engine.warmup()?;
     println!("Ready!");
-    
+
     let engine = Arc::new(Mutex::new(engine));
     let audio_buffer = Arc::new(Mutex::new(Vec::<i16>::new()));
     let is_recording = Arc::new(AtomicBool::new(false));
     let is_locked = Arc::new(AtomicBool::new(false));
     let recording_stream: Arc<Mutex<Option<cpal::Stream>>> = Arc::new(Mutex::new(None));
-    // Track performance history: (audio_duration_sec, realtime_factor)
     let performance_history: Arc<Mutex<VecDeque<(f32, f32)>>> = Arc::new(Mutex::new(VecDeque::with_capacity(10)));
-    // Press Enter after paste flag
     let press_enter_after_paste = Arc::new(AtomicBool::new(false));
-    // No inject flag (for Electron mode)
     let no_inject_flag = Arc::new(AtomicBool::new(no_inject));
-    
-    let host = cpal::default_host();
-    let device = if input_source == "radio" {
-        // Radio mode: use External Microphone (headphone jack) like memo-RF, unless overridden
-        let radio_spec = std::env::var("MEMO_RADIO_INPUT_DEVICE")
-            .unwrap_or_else(|_| "External Microphone".to_string());
-        find_radio_input_device(&host, &radio_spec)
-            .ok_or_else(|| format!("No input device found for Radio (spec: {:?}). Set MEMO_RADIO_INPUT_DEVICE=0 or device name.", radio_spec))?
-    } else {
-        host.default_input_device()
-            .ok_or("No input device found")?
-    };
-    println!("Using: {}", device.name()?);
-    
-    let config = device.default_input_config()?;
-    let sample_rate = config.sample_rate().0;
-    println!("Sample rate: {} Hz, Format: {:?}", sample_rate, config.sample_format());
-    
+
+    let streaming_enabled = std::env::var("STREAMING_TRANSCRIBE")
+        .map(|v| v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(true);
+    let seg_silence_threshold: f32 = std::env::var("SEGMENT_SILENCE_THRESHOLD")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(600.0);
+    let seg_silence_ms: u64 = std::env::var("SEGMENT_SILENCE_MS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1200);
+    let seg_min_duration_ms: u64 = std::env::var("SEGMENT_MIN_DURATION_MS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(15000);
+    let seg_max_duration_ms: u64 = 28000;
+    let segment_results: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let segment_boundary: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let segmenter_active = Arc::new(AtomicBool::new(false));
+    let last_segment_text: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
     let audio_buffer_clone = audio_buffer.clone();
     let is_recording_clone = is_recording.clone();
     let is_locked_clone = is_locked.clone();
     let recording_stream_clone = recording_stream.clone();
     let device_clone = device.clone();
     let config_clone = config.clone();
+    let stream_ch = stream_channels;
     let engine_clone = engine.clone();
+    let segment_results_clone = segment_results.clone();
+    let segment_boundary_clone = segment_boundary.clone();
+    let segmenter_active_clone = segmenter_active.clone();
+    let last_segment_text_clone = last_segment_text.clone();
     let performance_history_clone = performance_history.clone();
     
     let (tx, rx) = mpsc::channel::<KeyEvent>();
@@ -976,6 +1223,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let use_vad_trigger = input_source == "radio";
 
     if use_vad_trigger {
+        let vad_ch = stream_ch;
         // Radio mode: VAD trigger. One continuous stream feeds both VAD and recording buffer.
         let vad_buffer: Arc<Mutex<VecDeque<i16>>> = Arc::new(Mutex::new(VecDeque::with_capacity(48000)));
         const VAD_BUFFER_MAX_SAMPLES: usize = 48000; // 1 second at 48 kHz
@@ -1005,7 +1253,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let device_vad = device_clone.clone();
         let config_vad = config_clone.clone();
         let tx_vad = tx.clone();
-        let last_audio_level_sent_vad = Arc::new(Mutex::new(Instant::now()));
+        let last_audio_level_sent_vad = Arc::new(Mutex::new(None::<Instant>));
 
         // Thread 1: continuous stream — push to vad_buffer and to audio_buffer when recording; send AUDIO_LEVELS for waveform
         std::thread::spawn(move || {
@@ -1015,21 +1263,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cpal::SampleFormat::I16 => device_vad.build_input_stream(
                     &stream_config,
                     move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                        let mut mono_frame = Vec::with_capacity(data.len() / vad_ch.max(1));
+                        extend_buffer_mono_i16(&mut mono_frame, data, vad_ch);
                         {
                             let mut buf = vad_buffer_for_stream.lock().unwrap();
-                            buf.extend(data.iter().copied());
+                            buf.extend(mono_frame.iter().copied());
                             while buf.len() > VAD_BUFFER_MAX_SAMPLES {
                                 buf.pop_front();
                             }
                         }
                         if is_recording_vad.load(Ordering::Acquire) {
-                            audio_buffer_vad.lock().unwrap().extend_from_slice(data);
-                            let levels = calculate_audio_levels(data);
+                            audio_buffer_vad
+                                .lock()
+                                .unwrap()
+                                .extend_from_slice(&mono_frame);
+                            let levels = calculate_audio_levels(&mono_frame);
                             let mut last_sent = last_audio_level_sent_clone.lock().unwrap();
-                            if last_sent.elapsed().as_millis() >= 50 {
+                            if should_emit_audio_levels_throttled(
+                                &mut *last_sent,
+                                memo_audio_levels_interval_ms(),
+                            ) {
                                 let json = json!(levels).to_string();
-                                println!("AUDIO_LEVELS:{}", json);
-                                *last_sent = Instant::now();
+                                println_ui_flush!("AUDIO_LEVELS:{}", json);
                             }
                         }
                     },
@@ -1039,25 +1294,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cpal::SampleFormat::F32 => device_vad.build_input_stream(
                     &stream_config,
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        let i16_data: Vec<i16> = data
-                            .iter()
-                            .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
-                            .collect();
+                        let mut mono_frame = Vec::with_capacity(data.len() / vad_ch.max(1));
+                        extend_buffer_mono_f32(&mut mono_frame, data, vad_ch);
                         {
                             let mut buf = vad_buffer_for_stream.lock().unwrap();
-                            buf.extend(i16_data.iter().copied());
+                            buf.extend(mono_frame.iter().copied());
                             while buf.len() > VAD_BUFFER_MAX_SAMPLES {
                                 buf.pop_front();
                             }
                         }
                         if is_recording_vad.load(Ordering::Acquire) {
-                            audio_buffer_vad.lock().unwrap().extend_from_slice(&i16_data);
-                            let levels = calculate_audio_levels(&i16_data);
+                            audio_buffer_vad
+                                .lock()
+                                .unwrap()
+                                .extend_from_slice(&mono_frame);
+                            let levels = calculate_audio_levels(&mono_frame);
                             let mut last_sent = last_audio_level_sent_clone.lock().unwrap();
-                            if last_sent.elapsed().as_millis() >= 50 {
+                            if should_emit_audio_levels_throttled(
+                                &mut *last_sent,
+                                memo_audio_levels_interval_ms(),
+                            ) {
                                 let json = json!(levels).to_string();
-                                println!("AUDIO_LEVELS:{}", json);
-                                *last_sent = Instant::now();
+                                println_ui_flush!("AUDIO_LEVELS:{}", json);
                             }
                         }
                     },
@@ -1067,25 +1325,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cpal::SampleFormat::U16 => device_vad.build_input_stream(
                     &stream_config,
                     move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                        let i16_data: Vec<i16> = data
-                            .iter()
-                            .map(|&s| ((s as i32) - 32768) as i16)
-                            .collect();
+                        let mut mono_frame = Vec::with_capacity(data.len() / vad_ch.max(1));
+                        extend_buffer_mono_u16(&mut mono_frame, data, vad_ch);
                         {
                             let mut buf = vad_buffer_for_stream.lock().unwrap();
-                            buf.extend(i16_data.iter().copied());
+                            buf.extend(mono_frame.iter().copied());
                             while buf.len() > VAD_BUFFER_MAX_SAMPLES {
                                 buf.pop_front();
                             }
                         }
                         if is_recording_vad.load(Ordering::Acquire) {
-                            audio_buffer_vad.lock().unwrap().extend_from_slice(&i16_data);
-                            let levels = calculate_audio_levels(&i16_data);
+                            audio_buffer_vad
+                                .lock()
+                                .unwrap()
+                                .extend_from_slice(&mono_frame);
+                            let levels = calculate_audio_levels(&mono_frame);
                             let mut last_sent = last_audio_level_sent_clone.lock().unwrap();
-                            if last_sent.elapsed().as_millis() >= 50 {
+                            if should_emit_audio_levels_throttled(
+                                &mut *last_sent,
+                                memo_audio_levels_interval_ms(),
+                            ) {
                                 let json = json!(levels).to_string();
-                                println!("AUDIO_LEVELS:{}", json);
-                                *last_sent = Instant::now();
+                                println_ui_flush!("AUDIO_LEVELS:{}", json);
                             }
                         }
                     },
@@ -1219,20 +1480,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Vocabulary storage for voice commands
     #[derive(Clone)]
     struct Vocabulary {
-        apps: Vec<String>,
-        commands: Vec<String>,
+        app_names: Vec<String>,
+        app_commands: HashMap<String, Vec<String>>,
+        global_commands: Vec<String>,
     }
     
     let vocabulary = Arc::new(Mutex::new(Vocabulary {
-        apps: Vec::new(),
-        commands: Vec::new(),
+        app_names: Vec::new(),
+        app_commands: HashMap::new(),
+        global_commands: Vec::new(),
     }));
     
-    // Helper function to build combined prompt with app context and vocabulary
+    // Build prompt with only the active app's commands (+ global) to avoid hallucination
     let build_prompt = |app_name: String, window_title: String, vocab: &Vocabulary| -> Option<String> {
         let mut parts = Vec::new();
         
-        // Add app context
         if !app_name.is_empty() && app_name != "Unknown" {
             if !window_title.is_empty() {
                 parts.push(format!("You are transcribing for {}. The current window is: {}.", app_name, window_title));
@@ -1241,18 +1503,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         
-        // Add vocabulary for voice commands
-        if !vocab.apps.is_empty() || !vocab.commands.is_empty() {
-            let mut vocab_parts = Vec::new();
-            if !vocab.apps.is_empty() {
-                vocab_parts.push(format!("Voice commands: open {}.", vocab.apps.join(", ")));
+        if !vocab.app_names.is_empty() {
+            parts.push(format!("Voice commands: open {}.", vocab.app_names.join(", ")));
+        }
+        
+        let mut active_cmds: Vec<&str> = vocab.global_commands.iter().map(|s| s.as_str()).collect();
+        if !app_name.is_empty() {
+            let key = app_name.to_lowercase();
+            if let Some(cmds) = vocab.app_commands.get(&key) {
+                active_cmds.extend(cmds.iter().map(|s| s.as_str()));
             }
-            if !vocab.commands.is_empty() {
-                vocab_parts.push(format!("Commands: {}.", vocab.commands.join(", ")));
-            }
-            if !vocab_parts.is_empty() {
-                parts.push(vocab_parts.join(" "));
-            }
+        }
+        if !active_cmds.is_empty() {
+            parts.push(format!("Commands: {}.", active_cmds.join(", ")));
         }
         
         if parts.is_empty() {
@@ -1291,18 +1554,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // BLE commands - only work in BLE mode, log them here
                     eprintln!("MIC: Received BLE command (requires BLE mode): {}", cmd);
                 } else if let Some(value) = cmd.strip_prefix("VOCAB:") {
-                    // Parse vocabulary JSON: {"apps": [...], "commands": [...]}
                     if let Ok(vocab_json) = serde_json::from_str::<serde_json::Value>(value.trim()) {
                         let mut vocab = vocabulary_clone.lock().unwrap();
-                        vocab.apps = vocab_json.get("apps")
+                        vocab.app_names = vocab_json.get("appNames")
                             .and_then(|v| v.as_array())
                             .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                             .unwrap_or_default();
-                        vocab.commands = vocab_json.get("commands")
+                        vocab.global_commands = vocab_json.get("globalCommands")
                             .and_then(|v| v.as_array())
                             .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                             .unwrap_or_default();
-                        eprintln!("MIC: Vocabulary updated: {} apps, {} commands", vocab.apps.len(), vocab.commands.len());
+                        vocab.app_commands.clear();
+                        if let Some(obj) = vocab_json.get("appCommands").and_then(|v| v.as_object()) {
+                            for (key, val) in obj {
+                                if let Some(arr) = val.as_array() {
+                                    let cmds: Vec<String> = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                                    vocab.app_commands.insert(key.clone(), cmds);
+                                }
+                            }
+                        }
+                        eprintln!("MIC: Vocabulary updated: {} app names, {} apps with commands, {} global commands",
+                            vocab.app_names.len(), vocab.app_commands.len(), vocab.global_commands.len());
                     } else {
                         eprintln!("MIC: Failed to parse VOCAB command");
                     }
@@ -1315,13 +1587,104 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match rx.recv() {
             Ok(KeyEvent::StartRecording) => {
                 if is_recording_clone.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                    println!("🎤 Recording...");
+                    println_ui_flush!("🎤 Recording...");
                     audio_buffer_clone.lock().unwrap().clear();
+
+                    if streaming_enabled {
+                        segment_results_clone.lock().unwrap().clear();
+                        *segment_boundary_clone.lock().unwrap() = 0;
+                        *last_segment_text_clone.lock().unwrap() = None;
+                        segmenter_active_clone.store(true, Ordering::Release);
+
+                        let buf_seg = audio_buffer_clone.clone();
+                        let boundary_seg = segment_boundary_clone.clone();
+                        let active_seg = segmenter_active_clone.clone();
+                        let results_seg = segment_results_clone.clone();
+                        let engine_seg = engine_clone.clone();
+                        let vocab_seg = vocabulary.clone();
+                        let prev_text_seg = last_segment_text_clone.clone();
+                        let sr = sample_rate;
+                        std::thread::spawn(move || {
+                            let poll_ms: u64 = 50;
+                            let samples_per_poll = (sr as u64 * poll_ms / 1000) as usize;
+                            let mut silence_count_ms: u64 = 0;
+
+                            loop {
+                                std::thread::sleep(std::time::Duration::from_millis(poll_ms));
+                                if !active_seg.load(Ordering::Acquire) {
+                                    break;
+                                }
+
+                                let buf = buf_seg.lock().unwrap();
+                                let current_len = buf.len();
+                                let last_boundary = *boundary_seg.lock().unwrap();
+                                let segment_samples = current_len.saturating_sub(last_boundary);
+                                let segment_dur_ms = (segment_samples as u64 * 1000) / sr as u64;
+
+                                if segment_dur_ms < seg_min_duration_ms {
+                                    silence_count_ms = 0;
+                                    drop(buf);
+                                    continue;
+                                }
+
+                                let rms_window = samples_per_poll.min(segment_samples);
+                                if rms_window == 0 { drop(buf); continue; }
+                                let rms = compute_rms(&buf[current_len - rms_window..current_len]);
+
+                                if rms < seg_silence_threshold {
+                                    silence_count_ms += poll_ms;
+                                } else {
+                                    silence_count_ms = 0;
+                                }
+
+                                let should_segment = silence_count_ms >= seg_silence_ms
+                                    || segment_dur_ms >= seg_max_duration_ms;
+
+                                if should_segment {
+                                    let segment_audio: Vec<i16> = buf[last_boundary..current_len].to_vec();
+                                    *boundary_seg.lock().unwrap() = current_len;
+                                    drop(buf);
+                                    silence_count_ms = 0;
+
+                                    let eng = engine_seg.clone();
+                                    let res = results_seg.clone();
+                                    let voc = vocab_seg.clone();
+                                    let prev_text = prev_text_seg.clone();
+                                    std::thread::spawn(move || {
+                                        let mut eng = eng.lock().unwrap();
+                                        let (app_name, window_title) = app_detection::get_application_context();
+                                        let vocab = voc.lock().unwrap();
+                                        let mut prompt = build_prompt(app_name, window_title, &vocab);
+                                        if let Some(ref prev) = *prev_text.lock().unwrap() {
+                                            let context = if prev.len() > 200 { &prev[prev.len()-200..] } else { prev.as_str() };
+                                            prompt = Some(match prompt {
+                                                Some(p) => format!("{} {}", p, context),
+                                                None => context.to_string(),
+                                            });
+                                        }
+                                        eng.set_prompt(prompt);
+                                        match eng.transcribe(&segment_audio) {
+                                            Ok(text) if !text.trim().is_empty() => {
+                                                let trimmed = text.trim().to_string();
+                                                *prev_text.lock().unwrap() = Some(trimmed.clone());
+                                                res.lock().unwrap().push(trimmed);
+                                                eprintln!("[Streaming] Segment transcribed ({} chars)", text.len());
+                                            }
+                                            Ok(_) => eprintln!("[Streaming] Segment had no speech"),
+                                            Err(e) => eprintln!("[Streaming] Segment error: {}", e),
+                                        }
+                                    });
+                                } else {
+                                    drop(buf);
+                                }
+                            }
+                        });
+                    }
 
                     if !use_vad_trigger {
                         let buffer = audio_buffer_clone.clone();
                         let is_recording_for_audio = is_recording_clone.clone();
-                        let last_audio_level_sent = Arc::new(Mutex::new(Instant::now()));
+                        let last_audio_level_sent = Arc::new(Mutex::new(None::<Instant>));
                         let last_audio_level_sent_clone = last_audio_level_sent.clone();
                         let stream_config = config_clone.clone().into();
                         let stream_result = match config_clone.sample_format() {
@@ -1329,17 +1692,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             device_clone.build_input_stream(
                                 &stream_config,
                                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                                    buffer.lock().unwrap().extend_from_slice(data);
-                                    
-                                    // Calculate and send audio levels for waveform visualization
+                                    let mut b = buffer.lock().unwrap();
+                                    extend_buffer_mono_i16(&mut *b, data, stream_ch);
+
                                     if is_recording_for_audio.load(Ordering::Acquire) {
-                                        let levels = calculate_audio_levels(data);
+                                        let levels = audio_levels_interleaved_i16(data, stream_ch);
                                         let mut last_sent = last_audio_level_sent_clone.lock().unwrap();
-                                        // Throttle to ~20fps (50ms intervals)
-                                        if last_sent.elapsed().as_millis() >= 50 {
+                                        if should_emit_audio_levels_throttled(
+                                            &mut *last_sent,
+                                            memo_audio_levels_interval_ms(),
+                                        ) {
                                             let json = json!(levels).to_string();
-                                            println!("AUDIO_LEVELS:{}", json);
-                                            *last_sent = Instant::now();
+                                            println_ui_flush!("AUDIO_LEVELS:{}", json);
                                         }
                                     }
                                 },
@@ -1352,22 +1716,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &stream_config,
                                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                                     let mut buf = buffer.lock().unwrap();
-                                    let mut i16_samples = Vec::with_capacity(data.len());
-                                    for &s in data {
-                                        let i16_sample = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-                                        buf.push(i16_sample);
-                                        i16_samples.push(i16_sample);
-                                    }
-                                    
-                                    // Calculate and send audio levels for waveform visualization
+                                    extend_buffer_mono_f32(&mut *buf, data, stream_ch);
+
                                     if is_recording_for_audio.load(Ordering::Acquire) {
-                                        let levels = calculate_audio_levels(&i16_samples);
+                                        let levels = audio_levels_interleaved_f32(data, stream_ch);
                                         let mut last_sent = last_audio_level_sent_clone.lock().unwrap();
-                                        // Throttle to ~20fps (50ms intervals)
-                                        if last_sent.elapsed().as_millis() >= 50 {
+                                        if should_emit_audio_levels_throttled(
+                                            &mut *last_sent,
+                                            memo_audio_levels_interval_ms(),
+                                        ) {
                                             let json = json!(levels).to_string();
-                                            println!("AUDIO_LEVELS:{}", json);
-                                            *last_sent = Instant::now();
+                                            println_ui_flush!("AUDIO_LEVELS:{}", json);
                                         }
                                     }
                                 },
@@ -1380,22 +1739,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &stream_config,
                                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
                                     let mut buf = buffer.lock().unwrap();
-                                    let mut i16_samples = Vec::with_capacity(data.len());
-                                    for &s in data {
-                                        let i16_sample = ((s as i32) - 32768) as i16;
-                                        buf.push(i16_sample);
-                                        i16_samples.push(i16_sample);
-                                    }
-                                    
-                                    // Calculate and send audio levels for waveform visualization
+                                    extend_buffer_mono_u16(&mut *buf, data, stream_ch);
+
                                     if is_recording_for_audio.load(Ordering::Acquire) {
-                                        let levels = calculate_audio_levels(&i16_samples);
+                                        let levels = audio_levels_interleaved_u16(data, stream_ch);
                                         let mut last_sent = last_audio_level_sent_clone.lock().unwrap();
-                                        // Throttle to ~20fps (50ms intervals)
-                                        if last_sent.elapsed().as_millis() >= 50 {
+                                        if should_emit_audio_levels_throttled(
+                                            &mut *last_sent,
+                                            memo_audio_levels_interval_ms(),
+                                        ) {
                                             let json = json!(levels).to_string();
-                                            println!("AUDIO_LEVELS:{}", json);
-                                            *last_sent = Instant::now();
+                                            println_ui_flush!("AUDIO_LEVELS:{}", json);
                                         }
                                     }
                                 },
@@ -1420,6 +1774,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(KeyEvent::StopRecording) => {
                 if is_recording_clone.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                    segmenter_active_clone.store(false, Ordering::Release);
+
                     if !use_vad_trigger {
                         recording_stream_clone.lock().unwrap().take();
                     }
@@ -1428,6 +1784,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut buf = audio_buffer_clone.lock().unwrap();
                         std::mem::take(&mut *buf)
                     };
+
+                    let streaming_boundary = if streaming_enabled {
+                        *segment_boundary_clone.lock().unwrap()
+                    } else { 0 };
                     
                     if !samples.is_empty() {
                         // Encode audio to OPUS for saving (only for 16kHz, resample if needed)
@@ -1499,23 +1859,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let press_enter_clone = press_enter_after_paste.clone();
                         let no_inject_clone = no_inject_flag.clone();
                         let vocabulary_for_thread = vocabulary.clone();
+                        let segment_results_for_thread = segment_results_clone.clone();
+                        let last_seg_text_for_thread = last_segment_text_clone.clone();
                         let sample_count = samples.len();
                         let audio_duration = sample_count as f32 / sample_rate as f32;
                         let start_time = Instant::now();
                         std::thread::spawn(move || {
-                            println!("⏹️  Stopped ({} samples, {:.2}s)", sample_count, audio_duration);
+                            println_ui_flush!("⏹️  Stopped ({} samples, {:.2}s)", sample_count, audio_duration);
                             println!("🔄 Transcribing...");
                             let mut eng = engine_for_thread.lock().unwrap();
                             
                             // Capture application context and vocabulary before transcribing
                             let (app_name, window_title) = app_detection::get_application_context();
                             let vocab = vocabulary_for_thread.lock().unwrap();
-                            let prompt = build_prompt(app_name, window_title, &vocab);
-                            // Always set the prompt (even if empty, to clear previous context)
+                            let mut prompt = build_prompt(app_name, window_title, &vocab);
+                            if streaming_boundary > 0 {
+                                if let Some(ref prev) = *last_seg_text_for_thread.lock().unwrap() {
+                                    let context = if prev.len() > 200 { &prev[prev.len()-200..] } else { prev.as_str() };
+                                    prompt = Some(match prompt {
+                                        Some(p) => format!("{} {}", p, context),
+                                        None => context.to_string(),
+                                    });
+                                }
+                            }
                             eng.set_prompt(prompt);
-                            
+
+                            let accumulated_segments = if streaming_boundary > 0 {
+                                std::mem::take(&mut *segment_results_for_thread.lock().unwrap())
+                            } else { Vec::new() };
+                            let pre_processed_count = accumulated_segments.len();
+
                             let transcribe_start = Instant::now();
-                            match eng.transcribe(&samples) {
+                            let transcribe_result = if streaming_boundary > 0 {
+                                let final_text = if streaming_boundary < samples.len()
+                                    && samples.len() - streaming_boundary >= sample_rate as usize
+                                {
+                                    eng.transcribe(&samples[streaming_boundary..]).unwrap_or_default()
+                                } else if streaming_boundary < samples.len() {
+                                    String::new()
+                                } else {
+                                    String::new()
+                                };
+                                let mut parts = accumulated_segments;
+                                if !final_text.trim().is_empty() {
+                                    parts.push(final_text.trim().to_string());
+                                }
+                                let combined = join_segments(&parts);
+                                if combined.trim().is_empty() {
+                                    eng.transcribe(&samples)
+                                } else {
+                                    if pre_processed_count > 0 {
+                                        eprintln!("[Streaming] {} segments pre-processed, final segment transcribed", pre_processed_count);
+                                    }
+                                    Ok(combined)
+                                }
+                            } else {
+                                eng.transcribe(&samples)
+                            };
+                            match transcribe_result {
                                 Ok(text) => {
                                     let transcribe_time = transcribe_start.elapsed();
                                     let realtime_factor = audio_duration / transcribe_time.as_secs_f32();
@@ -1560,7 +1961,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let (app_name, window_title) = app_detection::get_application_context();
                                         
                                         // Process text to strip periods from short phrases
-                                        let processed_text = strip_trailing_signoffs(&strip_periods_from_short_phrases(&text));
+                                        let processed_text = strip_leading_dash_space(&strip_trailing_signoffs(&strip_periods_from_short_phrases(&text)));
                                         
                                         // Output FINAL: JSON for Electron app integration
                                         let json_output = json!({
@@ -1651,12 +2052,84 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Start recording if not already recording
                         // Manually trigger start recording logic
                         if is_recording_clone.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                            println!("🎤 Recording...");
+                            println_ui_flush!("🎤 Recording...");
                             audio_buffer_clone.lock().unwrap().clear();
-                            
+
+                            if streaming_enabled {
+                                segment_results_clone.lock().unwrap().clear();
+                                *segment_boundary_clone.lock().unwrap() = 0;
+                                *last_segment_text_clone.lock().unwrap() = None;
+                                segmenter_active_clone.store(true, Ordering::Release);
+
+                                let buf_seg = audio_buffer_clone.clone();
+                                let boundary_seg = segment_boundary_clone.clone();
+                                let active_seg = segmenter_active_clone.clone();
+                                let results_seg = segment_results_clone.clone();
+                                let engine_seg = engine_clone.clone();
+                                let vocab_seg = vocabulary.clone();
+                                let prev_text_seg = last_segment_text_clone.clone();
+                                let sr = sample_rate;
+                                std::thread::spawn(move || {
+                                    let poll_ms: u64 = 50;
+                                    let samples_per_poll = (sr as u64 * poll_ms / 1000) as usize;
+                                    let mut silence_count_ms: u64 = 0;
+                                    loop {
+                                        std::thread::sleep(std::time::Duration::from_millis(poll_ms));
+                                        if !active_seg.load(Ordering::Acquire) { break; }
+                                        let buf = buf_seg.lock().unwrap();
+                                        let current_len = buf.len();
+                                        let last_boundary = *boundary_seg.lock().unwrap();
+                                        let segment_samples = current_len.saturating_sub(last_boundary);
+                                        let segment_dur_ms = (segment_samples as u64 * 1000) / sr as u64;
+                                        if segment_dur_ms < seg_min_duration_ms {
+                                            silence_count_ms = 0; drop(buf); continue;
+                                        }
+                                        let rms_window = samples_per_poll.min(segment_samples);
+                                        if rms_window == 0 { drop(buf); continue; }
+                                        let rms = compute_rms(&buf[current_len - rms_window..current_len]);
+                                        if rms < seg_silence_threshold { silence_count_ms += poll_ms; } else { silence_count_ms = 0; }
+                                        let should_segment = silence_count_ms >= seg_silence_ms || segment_dur_ms >= seg_max_duration_ms;
+                                        if should_segment {
+                                            let segment_audio: Vec<i16> = buf[last_boundary..current_len].to_vec();
+                                            *boundary_seg.lock().unwrap() = current_len;
+                                            drop(buf);
+                                            silence_count_ms = 0;
+                                            let eng = engine_seg.clone();
+                                            let res = results_seg.clone();
+                                            let voc = vocab_seg.clone();
+                                            let prev_text = prev_text_seg.clone();
+                                            std::thread::spawn(move || {
+                                                let mut eng = eng.lock().unwrap();
+                                                let (app_name, window_title) = app_detection::get_application_context();
+                                                let vocab = voc.lock().unwrap();
+                                                let mut prompt = build_prompt(app_name, window_title, &vocab);
+                                                if let Some(ref prev) = *prev_text.lock().unwrap() {
+                                                    let context = if prev.len() > 200 { &prev[prev.len()-200..] } else { prev.as_str() };
+                                                    prompt = Some(match prompt {
+                                                        Some(p) => format!("{} {}", p, context),
+                                                        None => context.to_string(),
+                                                    });
+                                                }
+                                                eng.set_prompt(prompt);
+                                                match eng.transcribe(&segment_audio) {
+                                                    Ok(text) if !text.trim().is_empty() => {
+                                                        let trimmed = text.trim().to_string();
+                                                        *prev_text.lock().unwrap() = Some(trimmed.clone());
+                                                        res.lock().unwrap().push(trimmed);
+                                                        eprintln!("[Streaming] Segment transcribed ({} chars)", text.len());
+                                                    }
+                                                    Ok(_) => eprintln!("[Streaming] Segment had no speech"),
+                                                    Err(e) => eprintln!("[Streaming] Segment error: {}", e),
+                                                }
+                                            });
+                                        } else { drop(buf); }
+                                    }
+                                });
+                            }
+
                             let buffer = audio_buffer_clone.clone();
                             let is_recording_for_audio_lock = is_recording_clone.clone();
-                            let last_audio_level_sent_lock = Arc::new(Mutex::new(Instant::now()));
+                            let last_audio_level_sent_lock = Arc::new(Mutex::new(None::<Instant>));
                             let last_audio_level_sent_lock_clone = last_audio_level_sent_lock.clone();
                             let stream_config = config_clone.clone().into();
                             let stream_result = match config_clone.sample_format() {
@@ -1664,16 +2137,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     device_clone.build_input_stream(
                                         &stream_config,
                                         move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                                            buffer.lock().unwrap().extend_from_slice(data);
-                                            
-                                            // Calculate and send audio levels for waveform visualization
+                                            let mut b = buffer.lock().unwrap();
+                                            extend_buffer_mono_i16(&mut *b, data, stream_ch);
+
                                             if is_recording_for_audio_lock.load(Ordering::Acquire) {
-                                                let levels = calculate_audio_levels(data);
+                                                let levels = audio_levels_interleaved_i16(data, stream_ch);
                                                 let mut last_sent = last_audio_level_sent_lock_clone.lock().unwrap();
-                                                if last_sent.elapsed().as_millis() >= 50 {
+                                                if should_emit_audio_levels_throttled(
+                                                    &mut *last_sent,
+                                                    memo_audio_levels_interval_ms(),
+                                                ) {
                                                     let json = json!(levels).to_string();
-                                                    println!("AUDIO_LEVELS:{}", json);
-                                                    *last_sent = Instant::now();
+                                                    println_ui_flush!("AUDIO_LEVELS:{}", json);
                                                 }
                                             }
                                         },
@@ -1686,21 +2161,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         &stream_config,
                                         move |data: &[f32], _: &cpal::InputCallbackInfo| {
                                             let mut buf = buffer.lock().unwrap();
-                                            let mut i16_samples = Vec::with_capacity(data.len());
-                                            for &s in data {
-                                                let i16_sample = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-                                                buf.push(i16_sample);
-                                                i16_samples.push(i16_sample);
-                                            }
-                                            
-                                            // Calculate and send audio levels for waveform visualization
+                                            extend_buffer_mono_f32(&mut *buf, data, stream_ch);
+
                                             if is_recording_for_audio_lock.load(Ordering::Acquire) {
-                                                let levels = calculate_audio_levels(&i16_samples);
+                                                let levels = audio_levels_interleaved_f32(data, stream_ch);
                                                 let mut last_sent = last_audio_level_sent_lock_clone.lock().unwrap();
-                                                if last_sent.elapsed().as_millis() >= 50 {
+                                                if should_emit_audio_levels_throttled(
+                                                    &mut *last_sent,
+                                                    memo_audio_levels_interval_ms(),
+                                                ) {
                                                     let json = json!(levels).to_string();
-                                                    println!("AUDIO_LEVELS:{}", json);
-                                                    *last_sent = Instant::now();
+                                                    println_ui_flush!("AUDIO_LEVELS:{}", json);
                                                 }
                                             }
                                         },
@@ -1713,21 +2184,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         &stream_config,
                                         move |data: &[u16], _: &cpal::InputCallbackInfo| {
                                             let mut buf = buffer.lock().unwrap();
-                                            let mut i16_samples = Vec::with_capacity(data.len());
-                                            for &s in data {
-                                                let i16_sample = ((s as i32) - 32768) as i16;
-                                                buf.push(i16_sample);
-                                                i16_samples.push(i16_sample);
-                                            }
-                                            
-                                            // Calculate and send audio levels for waveform visualization
+                                            extend_buffer_mono_u16(&mut *buf, data, stream_ch);
+
                                             if is_recording_for_audio_lock.load(Ordering::Acquire) {
-                                                let levels = calculate_audio_levels(&i16_samples);
+                                                let levels = audio_levels_interleaved_u16(data, stream_ch);
                                                 let mut last_sent = last_audio_level_sent_lock_clone.lock().unwrap();
-                                                if last_sent.elapsed().as_millis() >= 50 {
+                                                if should_emit_audio_levels_throttled(
+                                                    &mut *last_sent,
+                                                    memo_audio_levels_interval_ms(),
+                                                ) {
                                                     let json = json!(levels).to_string();
-                                                    println!("AUDIO_LEVELS:{}", json);
-                                                    *last_sent = Instant::now();
+                                                    println_ui_flush!("AUDIO_LEVELS:{}", json);
                                                 }
                                             }
                                         },
@@ -1755,12 +2222,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if is_recording_clone.load(Ordering::Acquire) {
                         // Manually trigger stop recording logic
                         if is_recording_clone.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                            segmenter_active_clone.store(false, Ordering::Release);
                             recording_stream_clone.lock().unwrap().take();
                             
                             let samples = {
                                 let mut buf = audio_buffer_clone.lock().unwrap();
                                 std::mem::take(&mut *buf)
                             };
+
+                            let streaming_boundary = if streaming_enabled {
+                                *segment_boundary_clone.lock().unwrap()
+                            } else { 0 };
                             
                             if !samples.is_empty() {
                                 // Spawn transcription thread immediately for fastest response
@@ -1769,23 +2241,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let press_enter_clone = press_enter_after_paste.clone();
                                 let no_inject_clone = no_inject_flag.clone();
                                 let vocabulary_for_thread = vocabulary.clone();
+                                let segment_results_for_thread = segment_results_clone.clone();
+                                let last_seg_text_for_thread = last_segment_text_clone.clone();
                                 let sample_count = samples.len();
                                 let audio_duration = sample_count as f32 / sample_rate as f32;
                                 let start_time = Instant::now();
                                 std::thread::spawn(move || {
-                                    println!("⏹️  Stopped ({} samples, {:.2}s)", sample_count, audio_duration);
+                                    println_ui_flush!("⏹️  Stopped ({} samples, {:.2}s)", sample_count, audio_duration);
                                     println!("🔄 Transcribing...");
                                     let mut eng = engine_for_thread.lock().unwrap();
                                     
                                     // Capture application context and vocabulary before transcribing
                                     let (app_name, window_title) = app_detection::get_application_context();
                                     let vocab = vocabulary_for_thread.lock().unwrap();
-                                    let prompt = build_prompt(app_name, window_title, &vocab);
-                                    // Always set the prompt (even if empty, to clear previous context)
+                                    let mut prompt = build_prompt(app_name, window_title, &vocab);
+                                    if streaming_boundary > 0 {
+                                        if let Some(ref prev) = *last_seg_text_for_thread.lock().unwrap() {
+                                            let context = if prev.len() > 200 { &prev[prev.len()-200..] } else { prev.as_str() };
+                                            prompt = Some(match prompt {
+                                                Some(p) => format!("{} {}", p, context),
+                                                None => context.to_string(),
+                                            });
+                                        }
+                                    }
                                     eng.set_prompt(prompt);
-                                    
+
+                                    let accumulated_segments = if streaming_boundary > 0 {
+                                        std::mem::take(&mut *segment_results_for_thread.lock().unwrap())
+                                    } else { Vec::new() };
+                                    let pre_processed_count = accumulated_segments.len();
+
                                     let transcribe_start = Instant::now();
-                                    match eng.transcribe(&samples) {
+                                    let transcribe_result = if streaming_boundary > 0 {
+                                        let final_text = if streaming_boundary < samples.len()
+                                            && samples.len() - streaming_boundary >= sample_rate as usize
+                                        {
+                                            eng.transcribe(&samples[streaming_boundary..]).unwrap_or_default()
+                                        } else if streaming_boundary < samples.len() {
+                                            String::new()
+                                        } else {
+                                            String::new()
+                                        };
+                                        let mut parts = accumulated_segments;
+                                        if !final_text.trim().is_empty() {
+                                            parts.push(final_text.trim().to_string());
+                                        }
+                                        let combined = join_segments(&parts);
+                                        if combined.trim().is_empty() {
+                                            eng.transcribe(&samples)
+                                        } else {
+                                            if pre_processed_count > 0 {
+                                                eprintln!("[Streaming] {} segments pre-processed, final segment transcribed", pre_processed_count);
+                                            }
+                                            Ok(combined)
+                                        }
+                                    } else {
+                                        eng.transcribe(&samples)
+                                    };
+                                    match transcribe_result {
                                         Ok(text) => {
                                             let transcribe_time = transcribe_start.elapsed();
                                             let realtime_factor = audio_duration / transcribe_time.as_secs_f32();
@@ -1830,7 +2343,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 let (app_name, window_title) = app_detection::get_application_context();
                                                 
                                                 // Process text to strip periods from short phrases
-                                                let processed_text = strip_trailing_signoffs(&strip_periods_from_short_phrases(&text));
+                                                let processed_text = strip_leading_dash_space(&strip_trailing_signoffs(&strip_periods_from_short_phrases(&text)));
                                                 
                                                 // Output FINAL: JSON for Electron app integration
                                                 let json_output = json!({

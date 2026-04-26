@@ -223,7 +223,7 @@ memo-stt automatically discovers BLE devices matching:
    - Bitrate: 24 kbps (VOIP-optimized)
 
 2. **Control TX** (`1234A003-1234-5678-1234-56789ABCDEF0`)
-   - Button events: `0x01` (start), `0x02` (stop)
+   - Button events: `0x01` (start), `0x02` (stop), `0x03` (second tap after stop → desktop Enter via `BLE_PRESS_ENTER`)
    - Enables hardware trigger functionality
 
 ### BLE Usage Examples
@@ -248,7 +248,7 @@ use memo_stt::ble::BleAudioReceiver;
 // Use BLE device as trigger, audio from system mic
 let receiver = BleAudioReceiver::connect_trigger_only().await?;
 
-// Listen for button press events (0x01, 0x02)
+// Listen for button press events (0x01, 0x02, 0x03)
 let button_event = receiver.receive_control_event().await?;
 ```
 
@@ -258,8 +258,7 @@ let button_event = receiver.receive_control_event().await?;
 # Use BLE audio input
 INPUT_SOURCE=ble cargo run --bin memo-stt
 
-# Use BLE trigger with system microphone (hybrid mode)
-INPUT_SOURCE=ble_trigger cargo run --bin memo-stt
+# Note: “BLE trigger + system mic” is handled by the desktop app, not the standalone binary.
 ```
 
 ## Standalone Binary Application
@@ -283,9 +282,6 @@ memo-stt --hotkey Control
 
 # BLE audio mode
 INPUT_SOURCE=ble memo-stt
-
-# BLE trigger mode (BLE button, system mic)
-INPUT_SOURCE=ble_trigger memo-stt
 ```
 
 ### Features
@@ -326,8 +322,14 @@ The binary outputs JSON with transcription results and context:
 
 | Variable | Values | Description |
 |----------|--------|-------------|
-| `INPUT_SOURCE` | `mic` (default), `ble`, `ble_trigger` | Audio input source |
-| `PRESS_ENTER_AFTER_PASTE` | `true`, `false` | Auto-submit after paste |
+| `INPUT_SOURCE` | `system` (default), `ble`, `radio` | Audio input source |
+| `MEMO_AUDIO_LEVELS_INTERVAL_MS` | `0` (default) or ms | Throttle `AUDIO_LEVELS:` lines for waveform. `0` emits every frame/callback. |
+
+#### UI / desktop integration lines
+
+When used under the desktop app, the binary writes lightweight protocol lines to stdout:
+- `AUDIO_LEVELS:<json array>` — 7 waveform values in 0–1
+- `BLE_PRESS_ENTER` — emitted on BLE control `0x03` (second tap after stop; desktop queues Return after paste)
 
 ### Binary Performance
 

@@ -1,5 +1,8 @@
 /*
  * Opus Codec - Encodes PCM to Opus and decodes Opus-encoded audio frames to PCM
+ *
+ * Receiver frame size must match firmware: 20ms at 16kHz = 320 samples per frame.
+ * (Firmware changed from 10ms/160 to 20ms/320; opus_decode() must output 320 samples per frame.)
  */
 
 use anyhow::{Context, Result};
@@ -7,28 +10,31 @@ use audiopus::coder::{Decoder, Encoder};
 use audiopus::{Application, Channels, SampleRate};
 use log::{debug, warn};
 
-/// Opus decoder wrapper
+/// Opus decoder wrapper.
+/// Frame size is 320 samples (20ms at 16kHz); must match firmware encoder.
 pub struct OpusDecoder {
     decoder: Decoder,
     sample_rate: u32,
+    /// 320 samples = 20ms at 16kHz (must match firmware)
     frame_size_samples: usize,
 }
 
 impl OpusDecoder {
     /// Create a new Opus decoder
-    /// 
+    ///
     /// # Arguments
     /// * `sample_rate` - Sample rate in Hz (must be 16000)
-    /// * `frame_duration_ms` - Frame duration in milliseconds (must be 20 for Opus)
+    /// * `frame_duration_ms` - Frame duration in milliseconds (must be 20 to match firmware)
     pub fn new(sample_rate: u32, frame_duration_ms: u32) -> Result<Self> {
         if sample_rate != 16000 {
             anyhow::bail!("Opus decoder only supports 16kHz");
         }
-        
+
         if frame_duration_ms != 20 {
-            anyhow::bail!("Opus decoder only supports 20ms frames");
+            anyhow::bail!("Opus decoder only supports 20ms frames (must match firmware)");
         }
-        
+
+        // 20ms at 16kHz = 320 samples per frame (firmware sends 1 frame per bundle with 20ms)
         let frame_size_samples = (sample_rate * frame_duration_ms / 1000) as usize;
         
         // Create Opus decoder (mono, 16kHz)
@@ -66,7 +72,34 @@ impl OpusDecoder {
         
         // Truncate to actual number of samples decoded
         pcm.truncate(samples_decoded);
-        
+
+        Ok(pcm)
+    }
+
+    /// Decode the previous (lost) frame using in-band FEC from the next packet.
+    /// Call this when the previous packet was lost; pass the current packet's first frame.
+    /// Then decode the current packet normally (e.g. via decode_bundle).
+    pub fn decode_frame_with_fec(&mut self, next_frame_data: &[u8]) -> Result<Vec<i16>> {
+        if next_frame_data.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pcm = vec![0i16; self.frame_size_samples];
+        let samples_decoded = self
+            .decoder
+            .decode(Some(next_frame_data), &mut pcm, true)
+            .context("Failed to decode FEC frame")?;
+        pcm.truncate(samples_decoded);
+        Ok(pcm)
+    }
+
+    /// Generate one frame of packet-loss concealment (PLC). Use when a packet was lost and FEC is not used.
+    pub fn decode_plc(&mut self) -> Result<Vec<i16>> {
+        let mut pcm = vec![0i16; self.frame_size_samples];
+        let samples_decoded = self
+            .decoder
+            .decode(None::<&[u8]>, &mut pcm, false)
+            .context("Failed to decode PLC")?;
+        pcm.truncate(samples_decoded);
         Ok(pcm)
     }
 
@@ -123,6 +156,28 @@ impl OpusDecoder {
 
         debug!("Decoded {} frames to {} PCM samples", num_frames, pcm_samples.len());
         Ok(pcm_samples)
+    }
+
+    /// Decode bundle when the previous packet was lost: use in-band FEC from this packet to
+    /// reconstruct the lost frame, then decode this bundle normally. Returns
+    /// [reconstructed_previous_frame][this_bundle_frames].
+    pub fn decode_bundle_with_fec(&mut self, bundle_data: &[u8]) -> Result<Vec<i16>> {
+        if bundle_data.len() < 2 {
+            return self.decode_bundle(bundle_data);
+        }
+        let num_frames = bundle_data[0] as usize;
+        if num_frames == 0 {
+            return self.decode_bundle(bundle_data);
+        }
+        let first_frame_len = bundle_data[1] as usize;
+        if 2 + first_frame_len > bundle_data.len() {
+            return self.decode_bundle(bundle_data);
+        }
+        let first_frame = &bundle_data[2..2 + first_frame_len];
+        let mut fec_pcm = self.decode_frame_with_fec(first_frame)?;
+        let mut bundle_pcm = self.decode_bundle(bundle_data)?;
+        fec_pcm.append(&mut bundle_pcm);
+        Ok(fec_pcm)
     }
 
     /// Get the frame size in samples

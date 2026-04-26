@@ -30,6 +30,7 @@ const MEMO_BATTERY_CHAR_UUID: &str = "1234A004-1234-5678-1234-56789ABCDEF0";
 // Control response values from firmware
 const RESP_SPEECH_START: u8 = 0x01;  // 1 - Recording started
 const RESP_SPEECH_END: u8 = 0x02;    // 2 - Recording ended
+const RESP_PRESS_ENTER: u8 = 0x03;   // 3 - Second tap shortly after stop (desktop Enter)
 
 pub struct BleAudioReceiver {
     periph: Option<Peripheral>,
@@ -511,7 +512,10 @@ impl BleAudioReceiver {
                     debug!("Received control notification: 0x{:02X} ({})", response_code, response_code);
                     
                     // Return the response code if it's a speech start/end event
-                    if response_code == RESP_SPEECH_START || response_code == RESP_SPEECH_END {
+                    if response_code == RESP_SPEECH_START
+                        || response_code == RESP_SPEECH_END
+                        || response_code == RESP_PRESS_ENTER
+                    {
                         return NotificationResult::Control(response_code);
                     }
                 }
@@ -567,7 +571,7 @@ impl BleAudioReceiver {
 #[derive(Debug)]
 pub enum NotificationResult {
     Audio(Vec<u8>),
-    Control(u8),  // RESP_SPEECH_START (0x01) or RESP_SPEECH_END (0x02)
+    Control(u8),  // RESP_SPEECH_START / RESP_SPEECH_END / RESP_PRESS_ENTER
     None,
 }
 
