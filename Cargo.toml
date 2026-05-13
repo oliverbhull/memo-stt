@@ -1,16 +1,16 @@
 [package]
 name = "memo-stt"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.74"
 authors = ["Oliver Hull <ohull7@gmail.com>"]
-description = "Plug-and-play speech-to-text for Rust. Add local Whisper transcription to any app in a few lines, with automatic GPU acceleration and zero configuration."
+description = "Plug-and-play speech-to-text for Rust. Add local transcription to any app in a few lines, with automatic GPU acceleration and zero configuration."
 license = "MIT"
 repository = "https://github.com/oliverbhull/memo-stt"
 homepage = "https://github.com/oliverbhull/memo-stt"
 documentation = "https://docs.rs/memo-stt"
 readme = "README.md"
-keywords = ["speech-to-text", "whisper", "stt", "transcription", "asr"]
+keywords = ["speech-to-text", "stt", "transcription", "asr", "local"]
 categories = [
     "multimedia::audio",
     "science",
@@ -54,7 +54,7 @@ binary = [
 ]
 
 [dependencies]
-# Core: Whisper inference with optional Metal GPU acceleration on macOS.
+# Core local inference with optional Metal GPU acceleration on macOS.
 whisper-rs = { version = "0.12", features = ["metal"] }
 
 # Pick a sensible default thread count for transcription.

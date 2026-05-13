@@ -1,8 +1,8 @@
 # memo-stt
 
-Plug-and-play, local speech-to-text for Rust. Add Whisper transcription to any
-application in a few lines — no API keys, no cloud calls, automatic GPU
-acceleration where available, and the model downloads itself on first use.
+Plug-and-play speech-to-text for Rust. Add local transcription to any app in a
+few lines, with automatic GPU acceleration and zero configuration. Avoid
+expensive API calls.
 
 [![crates.io](https://img.shields.io/crates/v/memo-stt.svg)](https://crates.io/crates/memo-stt)
 [![docs.rs](https://docs.rs/memo-stt/badge.svg)](https://docs.rs/memo-stt)
@@ -35,8 +35,8 @@ directory. Every subsequent run is fully offline.
 - **Zero configuration.** No API keys, no environment variables, no
   manual model setup.
 - **Local and private.** Audio never leaves the machine.
-- **Automatic GPU acceleration.** Metal on macOS via `whisper.cpp`; CUDA on
-  Linux/Windows when available; clean CPU fallback otherwise.
+- **Automatic GPU acceleration.** Metal on macOS; CUDA on Linux/Windows when
+  available; clean CPU fallback otherwise.
 - **Simple, three-method API.** `new_default` / `warmup` / `transcribe`.
 - **Cross-platform.** macOS, Linux, Windows.
 
@@ -62,7 +62,7 @@ Models live in your platform cache directory:
 - **Windows**: `%LOCALAPPDATA%\memo-stt\models\`
 
 Pre-built models can be downloaded from the
-[whisper.cpp model repository on Hugging Face](https://huggingface.co/ggerganov/whisper.cpp).
+[model repository on Hugging Face](https://huggingface.co/ggerganov/whisper.cpp).
 
 ### Quantization, briefly
 
@@ -246,6 +246,4 @@ MIT — see [LICENSE](LICENSE).
 
 ## Acknowledgments
 
-- [whisper-rs](https://github.com/tazz4843/whisper-rs) — Rust bindings for whisper.cpp
-- [whisper.cpp](https://github.com/ggerganov/whisper.cpp) — Whisper inference in C/C++
-- [OpenAI Whisper](https://github.com/openai/whisper) — the original model
+Built on open-source local speech-recognition runtimes and model tooling.

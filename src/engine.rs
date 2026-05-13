@@ -74,7 +74,7 @@ impl SttEngine {
     ///
     /// # Arguments
     ///
-    /// * `model_path` - Path to Whisper model in GGML format, or model name
+    /// * `model_path` - Path to a GGML speech model, or model name
     /// * `input_sample_rate` - Sample rate of input audio (e.g., 16000, 48000)
     ///
     /// # Example
@@ -104,7 +104,7 @@ impl SttEngine {
             .to_str()
             .ok_or_else(|| crate::Error("Invalid model path".into()))?;
 
-        // Enable GPU/ACCEL auto-detection. whisper.cpp will use Metal/CUDA/
+        // Enable GPU/ACCEL auto-detection. The local runtime will use Metal/CUDA/
         // Vulkan/OpenCL where available and fall back to CPU otherwise.
         let params = WhisperContextParameters {
             use_gpu: true,

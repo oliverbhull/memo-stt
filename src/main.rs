@@ -133,7 +133,7 @@ fn strip_periods_from_short_phrases(text: &str) -> String {
     trimmed.to_string()
 }
 
-/// Strip leading dash and following space(s) from transcript (e.g. Whisper bullet-style "- Can you...").
+/// Strip leading dash and following space(s) from transcript (e.g. bullet-style "- Can you...").
 fn strip_leading_dash_space(text: &str) -> String {
     let s = text.trim();
     if s.starts_with('-') {
@@ -725,29 +725,17 @@ async fn run_ble_audio_mode(
         }
 
         // Wait for CONNECT_UID command - DO NOT auto-connect
-        let device_name = loop {
-            match connect_rx.recv().await {
-                Some(Some(name)) => {
-                    // Got connect command
-                    break Some(name);
-                }
-                Some(None) => {
-                    // Got disconnect command
-                    eprintln!("Disconnecting from BLE device");
-                    ble_receiver.disconnect().await.ok();
-                    println!("DISCONNECTED:user_requested");
-                    return Ok(());
-                }
-                None => {
-                    // Channel closed
-                    return Ok(());
-                }
+        let device_name = match connect_rx.recv().await {
+            Some(Some(name)) => name,
+            Some(None) => {
+                eprintln!("Disconnecting from BLE device");
+                ble_receiver.disconnect().await.ok();
+                println!("DISCONNECTED:user_requested");
+                return Ok(());
             }
-        };
-
-        let device_name = match device_name {
-            Some(name) => name,
-            None => continue,
+            None => {
+                return Ok(());
+            }
         };
 
         // Connect to device
@@ -1300,7 +1288,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "binary")]
         {
             // BLE audio is 16kHz, so initialize engine with 16kHz
-            println!("Loading Whisper model (16kHz for BLE audio)...");
+            println!("Loading speech model (16kHz for BLE audio)...");
             let engine = SttEngine::new_default(16000)?;
 
             println!("Warming up GPU...");
@@ -1350,7 +1338,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.sample_format()
     );
 
-    println!("Loading Whisper model ({} Hz input)...", sample_rate);
+    println!("Loading speech model ({} Hz input)...", sample_rate);
     let engine = SttEngine::new_default(sample_rate)?;
 
     println!("Warming up GPU...");

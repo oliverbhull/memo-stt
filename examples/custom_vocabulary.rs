@@ -1,7 +1,7 @@
 //! Custom-vocabulary example.
 //!
-//! Whisper accepts an "initial prompt" that biases the decoder toward
-//! specific terms — useful for product names, jargon, code identifiers, etc.
+//! The engine accepts an initial prompt that biases transcription toward
+//! specific terms, useful for product names, jargon, code identifiers, etc.
 //!
 //! Run with:
 //! ```bash

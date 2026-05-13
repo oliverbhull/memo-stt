@@ -77,7 +77,7 @@ fn download_model_if_needed(dest: &Path, model_name: &str) -> Result<PathBuf> {
 
     let url = format!("{}/{}", MODEL_BASE_URL, model_name);
 
-    eprintln!("📥 Downloading Whisper model (this is a one-time setup)...");
+    eprintln!("📥 Downloading speech model (this is a one-time setup)...");
     eprintln!("   Model: {}", model_name);
     eprintln!("   URL: {}", url);
     eprintln!("   Destination: {}", dest.display());

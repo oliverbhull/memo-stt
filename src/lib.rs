@@ -1,11 +1,9 @@
 //! # memo-stt
 //!
-//! Plug-and-play, local speech-to-text for Rust applications.
+//! Plug-and-play speech-to-text for Rust.
 //!
-//! `memo-stt` wraps [`whisper-rs`](https://crates.io/crates/whisper-rs) behind a
-//! small, three-method API and handles model download and platform GPU
-//! acceleration automatically so you can add transcription to any Rust app
-//! without configuration.
+//! Add local transcription to any app in a few lines, with automatic GPU
+//! acceleration and zero configuration. Avoid expensive API calls.
 //!
 //! ## Quick example
 //!
@@ -70,7 +68,7 @@ pub mod model;
 pub use engine::SttEngine;
 pub use model::{default_model_path, ensure_model};
 
-/// Default Whisper model name (`small.en` Q5_1).
+/// Default model name (`small.en` Q5_1).
 ///
 /// This is the recommended general-purpose model and is downloaded
 /// automatically on first use.
