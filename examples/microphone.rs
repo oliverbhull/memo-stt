@@ -1,16 +1,18 @@
-//! Microphone recording example
+//! Microphone recording is implemented in the standalone CLI rather than in
+//! the library, so this example just points you at the right entry point.
 //!
-//! This example shows how to record from the microphone and transcribe in real-time.
-//! Run with: `cargo run --example microphone`
-//!
-//! Note: This requires the binary dependencies (cpal, rdev) which are only
-//! available when running the main binary, not as a library example.
-//!
-//! For library usage, see the basic example.
+//! Install and run the CLI:
+//! ```bash
+//! cargo install memo-stt --features binary
+//! memo-stt
+//! ```
 
 fn main() {
-    println!("Microphone recording example");
-    println!("For full microphone recording, use the main binary:");
-    println!("  cargo run --bin memo-stt");
-    println!("\nFor library usage, see examples/basic.rs");
+    println!("Microphone capture lives in the memo-stt CLI.");
+    println!();
+    println!("Install and run with:");
+    println!("    cargo install memo-stt --features binary");
+    println!("    memo-stt");
+    println!();
+    println!("For library usage with your own audio source, see examples/basic.rs.");
 }

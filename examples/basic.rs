@@ -1,30 +1,34 @@
-//! Basic transcription example - the simplest possible usage
+//! Minimal transcription example.
 //!
-//! This example shows the absolute minimum code needed to transcribe audio.
-//! Run with: `cargo run --example basic`
+//! Run with:
+//! ```bash
+//! cargo run --example basic
+//! ```
+//!
+//! On the first run, the default model (~500 MB) will be downloaded
+//! automatically into your platform cache directory.
 
 use memo_stt::SttEngine;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Creating STT engine...");
-    
-    // Create engine with default model
-    // Note: You'll need to provide a valid model path
-    let mut engine = SttEngine::new("models/ggml-small.en-q5_1.bin", 16000)?;
-    
-    println!("Warming up GPU...");
+    println!("Creating STT engine (this may download the model on first run)...");
+    let mut engine = SttEngine::new_default(16000)?;
+
+    println!("Warming up...");
     engine.warmup()?;
-    
-    println!("Ready! Engine is initialized.");
-    println!("\nTo transcribe audio, provide PCM samples:");
-    println!("  let samples: Vec<i16> = /* your audio data */;");
-    println!("  let text = engine.transcribe(&samples)?;");
-    println!("  println!(\"Transcribed: {{}}\", text);");
-    
-    // Example with dummy data (replace with actual audio)
-    // let samples: Vec<i16> = vec![0; 16000]; // 1 second of silence
-    // let text = engine.transcribe(&samples)?;
-    // println!("Transcribed: {}", text);
-    
+
+    println!("Engine ready.");
+    println!();
+    println!("To transcribe, pass 16-bit mono PCM samples:");
+    println!("    let samples: Vec<i16> = /* your audio */;");
+    println!("    let text = engine.transcribe(&samples)?;");
+
+    // Example with one second of silence (just to demonstrate the call shape).
+    let samples = vec![0i16; 16_000];
+    match engine.transcribe(&samples) {
+        Ok(text) => println!("Transcribed (silence): {:?}", text),
+        Err(e) => println!("Transcribe error: {}", e),
+    }
+
     Ok(())
 }

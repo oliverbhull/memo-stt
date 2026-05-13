@@ -1,40 +1,46 @@
 //! # memo-stt
 //!
-//! **Plug-and-play speech-to-text for Rust applications.**
+//! Plug-and-play, local speech-to-text for Rust applications.
 //!
-//! Add voice transcription to your app in 3 lines of code. No API keys, no cloud services,
-//! no configuration. Just audio in, text out.
+//! `memo-stt` wraps [`whisper-rs`](https://crates.io/crates/whisper-rs) behind a
+//! small, three-method API and handles model download and platform GPU
+//! acceleration automatically so you can add transcription to any Rust app
+//! without configuration.
 //!
-//! ## Quick Example
+//! ## Quick example
 //!
 //! ```no_run
 //! use memo_stt::SttEngine;
 //!
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # fn run(audio_samples: &[i16]) -> Result<(), Box<dyn std::error::Error>> {
 //! let mut engine = SttEngine::new_default(16000)?;
 //! engine.warmup()?;
-//! let text = engine.transcribe(&audio_samples)?;
+//! let text = engine.transcribe(audio_samples)?;
 //! println!("Transcribed: {}", text);
 //! # Ok(())
 //! # }
 //! ```
 //!
+//! On the first call, the default model (`ggml-small.en-q5_1.bin`, ~500 MB) is
+//! downloaded into the platform cache directory. Every subsequent run is
+//! fully offline.
+//!
+//! ## Recommended model
+//!
+//! Use the default `ggml-small.en-q5_1.bin` for almost every use case. It is
+//! the best general-purpose balance of speed, size, and accuracy for English
+//! speech. Only pick a larger distil model if you specifically need higher
+//! accuracy on noisy audio or accented speech.
+//!
 //! ## Features
 //!
-//! - ✅ **Zero Configuration** - Works immediately after `cargo add memo-stt`
-//! - ✅ **GPU Accelerated** - Automatic Metal/CUDA acceleration
-//! - ✅ **Cross-Platform** - macOS, Windows, Linux
-//! - ✅ **Simple API** - Just 3 methods: `new()`, `warmup()`, `transcribe()`
-//! - ✅ **Fast** - Sub-second transcription latency
-//! - ✅ **Private** - All processing happens locally
-//!
-//! ## Use Cases
-//!
-//! - Voice commands in desktop apps
-//! - Dictation in text editors
-//! - Accessibility tools
-//! - Real-time transcription
-//! - Voice assistants
+//! - Zero configuration — model is auto-downloaded on first use.
+//! - Automatic GPU acceleration where supported (Metal on macOS, CUDA on
+//!   Linux/Windows when available); clean CPU fallback otherwise.
+//! - Three-method API: [`SttEngine::new_default`], [`SttEngine::warmup`],
+//!   [`SttEngine::transcribe`].
+//! - Fully local — audio never leaves the machine.
+//! - Cross-platform: macOS, Linux, Windows.
 //!
 //! ## Installation
 //!
@@ -43,21 +49,20 @@
 //! memo-stt = "0.1"
 //! ```
 //!
-//! ## Model Setup
+//! ## Audio format
 //!
-//! Models are automatically downloaded on first use! No manual setup required.
-//! The default model (`ggml-small.en-q5_1.bin`, ~500MB) will be downloaded to your
-//! cache directory when you first call `SttEngine::new_default()`.
+//! `memo-stt` expects 16-bit signed PCM mono samples (`&[i16]`). The input
+//! sample rate is whatever you declare to [`SttEngine::new`] /
+//! [`SttEngine::new_default`]; samples are resampled to 16 kHz internally.
 //!
-//! ## Comparison
+//! ## Standalone binary
 //!
-//! | Feature | memo-stt | whisper-rs | OpenAI API |
-//! |---------|----------|------------|------------|
-//! | Setup | ✅ Zero config | ❌ Complex | ❌ API keys |
-//! | Privacy | ✅ Local | ✅ Local | ❌ Cloud |
-//! | Cost | ✅ Free | ✅ Free | ❌ Per request |
-//! | Speed | ✅ Fast | ✅ Fast | ⚠️ Network latency |
-//! | GPU | ✅ Auto | ✅ Manual | N/A |
+//! A CLI with hotkey, microphone, and BLE-device support is available behind
+//! the `binary` feature:
+//!
+//! ```bash
+//! cargo install memo-stt --features binary
+//! ```
 
 pub mod engine;
 pub mod model;
@@ -65,12 +70,13 @@ pub mod model;
 pub use engine::SttEngine;
 pub use model::{default_model_path, ensure_model};
 
-/// Default Whisper model name (small.en Q5_1)
-/// 
-/// The model will be automatically downloaded to the cache directory on first use.
+/// Default Whisper model name (`small.en` Q5_1).
+///
+/// This is the recommended general-purpose model and is downloaded
+/// automatically on first use.
 pub const DEFAULT_MODEL: &str = "ggml-small.en-q5_1.bin";
 
-/// Simple error type
+/// Error type used throughout the crate.
 #[derive(Debug)]
 pub struct Error(pub String);
 
@@ -82,5 +88,5 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Result type alias
+/// Convenience `Result` alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, Error>;

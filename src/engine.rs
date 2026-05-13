@@ -1,8 +1,10 @@
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
-use std::path::Path;
-use std::sync::{Arc, Mutex};
 use crate::Result;
 use num_cpus;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
+};
 
 /// Speech-to-text engine optimized for speed and ease of use.
 ///
@@ -81,7 +83,7 @@ impl SttEngine {
     /// use memo_stt::SttEngine;
     /// // Use default model (auto-downloads if needed)
     /// let engine = SttEngine::new_default(16000)?;
-    /// 
+    ///
     /// // Or specify a custom path
     /// let engine = SttEngine::new("models/ggml-small.en-q5_1.bin", 16000)?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -93,24 +95,27 @@ impl SttEngine {
     /// - `ggml-distil-large-v3-q5_1.bin` (~500MB) - Higher accuracy
     /// - `ggml-distil-large-v3-q8_0.bin` (~800MB) - Highest accuracy
     ///
-    /// Models are downloaded from: https://huggingface.co/ggerganov/whisper.cpp
+    /// Models are downloaded from: <https://huggingface.co/ggerganov/whisper.cpp>
     pub fn new(model_path: impl AsRef<Path>, input_sample_rate: u32) -> Result<Self> {
         // Ensure model exists (may download if it's the default model)
         let path = crate::ensure_model(model_path)?;
 
-        let path_str = path.to_str().ok_or_else(|| crate::Error("Invalid model path".into()))?;
-        
-        // Enable GPU/ACCEL auto-detection (will use CPU if no GPU/ACCEL available)
-        // This allows whisper.cpp to automatically detect and use:
-        // - GPU backends (Metal, CUDA, Vulkan, OpenCL)
-        // - ACCEL backends (like Hailo AI Hat on Raspberry Pi)
-        let mut params = WhisperContextParameters::default();
-        params.use_gpu = true; // Enable GPU/ACCEL auto-detection
-        
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| crate::Error("Invalid model path".into()))?;
+
+        // Enable GPU/ACCEL auto-detection. whisper.cpp will use Metal/CUDA/
+        // Vulkan/OpenCL where available and fall back to CPU otherwise.
+        let params = WhisperContextParameters {
+            use_gpu: true,
+            ..WhisperContextParameters::default()
+        };
+
         let ctx = WhisperContext::new_with_params(path_str, params)
             .map_err(|e| crate::Error(format!("Failed to load model: {}", e)))?;
-        
-        let state = ctx.create_state()
+
+        let state = ctx
+            .create_state()
             .map_err(|e| crate::Error(format!("Failed to create state: {}", e)))?;
 
         Ok(Self {
@@ -186,7 +191,10 @@ impl SttEngine {
         }
 
         if self.f32_buffer.len() < 16000 {
-            return Err(crate::Error(format!("Audio too short: {} samples", self.f32_buffer.len())));
+            return Err(crate::Error(format!(
+                "Audio too short: {} samples",
+                self.f32_buffer.len()
+            )));
         }
 
         // Create params (reuse configuration pattern)
@@ -220,14 +228,19 @@ impl SttEngine {
         }
 
         // Lock state and run inference
-        let mut state = self.state.lock().map_err(|e| crate::Error(format!("State lock failed: {}", e)))?;
-        state.full(params, &self.f32_buffer)
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| crate::Error(format!("State lock failed: {}", e)))?;
+        state
+            .full(params, &self.f32_buffer)
             .map_err(|e| crate::Error(format!("Inference failed: {}", e)))?;
 
         // Extract text
-        let n = state.full_n_segments()
+        let n = state
+            .full_n_segments()
             .map_err(|e| crate::Error(format!("Failed to get segments: {}", e)))?;
-        
+
         let mut text = String::new();
         for i in 0..n {
             if let Ok(seg) = state.full_get_segment_text(i) {
@@ -284,7 +297,10 @@ impl SttEngine {
         params.set_print_progress(false);
         params.set_print_special(false);
         params.set_print_realtime(false);
-        let mut state = self.state.lock().map_err(|e| crate::Error(format!("State lock failed: {}", e)))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| crate::Error(format!("State lock failed: {}", e)))?;
         let _ = state.full(params, &vec![0.0f32; 1600]);
         Ok(())
     }
