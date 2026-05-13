@@ -62,7 +62,7 @@ num_cpus = "1.0"
 
 # Used to download the default model on first use.
 ureq = { version = "2.9", default-features = false, features = ["tls"] }
-dirs = "5.0"
+dirs = "6.0"
 
 # JSON output for the standalone binary.
 serde_json = "1.0"
